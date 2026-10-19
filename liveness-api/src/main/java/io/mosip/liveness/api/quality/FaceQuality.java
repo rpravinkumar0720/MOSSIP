@@ -1,7 +1,6 @@
 package io.mosip.liveness.api.quality;
 
 import java.util.Collections;
-import java.util.Objects;
 import java.util.Set;
 
 /**
