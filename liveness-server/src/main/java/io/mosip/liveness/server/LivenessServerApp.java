@@ -80,6 +80,9 @@ public class LivenessServerApp {
                 staticFiles.directory = "/web";
                 staticFiles.location = Location.CLASSPATH;
             });
+            javalinConfig.jetty.modifyWebSocketServletFactory(factory -> {
+                factory.setMaxTextMessageSize(1024 * 1024);
+            });
         });
 
         // WebSocket endpoint

@@ -19,7 +19,7 @@
 
     <licenses>
         <license>
-            <name>Mozilla Public License 2.0 / Apache License 2.0</name>
+            <name>Apache License, Version 2.0</name>
             <url>https://www.apache.org/licenses/LICENSE-2.0</url>
             <distribution>repo</distribution>
         </license>
@@ -28,6 +28,7 @@
     <modules>
         <module>liveness-api</module>
         <module>liveness-core</module>
+        <module>liveness-onnx</module>
         <module>liveness-device-mock</module>
         <module>liveness-server</module>
         <module>liveness-eval</module>
@@ -73,6 +74,11 @@
             <dependency>
                 <groupId>io.mosip.liveness</groupId>
                 <artifactId>liveness-device-mock</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.mosip.liveness</groupId>
+                <artifactId>liveness-onnx</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

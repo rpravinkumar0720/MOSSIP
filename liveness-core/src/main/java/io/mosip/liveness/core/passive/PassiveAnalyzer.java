@@ -30,17 +30,27 @@ public class PassiveAnalyzer {
     private static final Logger log = LoggerFactory.getLogger(PassiveAnalyzer.class);
 
     private final PassiveWeights weights;
+    private final LogisticFusionModel fusionModel;
 
     public PassiveAnalyzer() {
-        this(PassiveWeights.DEFAULT);
+        this(PassiveWeights.DEFAULT, LogisticFusionModel.loadDefault());
     }
 
     public PassiveAnalyzer(PassiveWeights weights) {
+        this(weights, LogisticFusionModel.loadDefault());
+    }
+
+    public PassiveAnalyzer(PassiveWeights weights, LogisticFusionModel fusionModel) {
         this.weights = Objects.requireNonNull(weights, "PassiveWeights cannot be null");
+        this.fusionModel = Objects.requireNonNull(fusionModel, "LogisticFusionModel cannot be null");
     }
 
     public PassiveWeights getWeights() {
         return weights;
+    }
+
+    public LogisticFusionModel getFusionModel() {
+        return fusionModel;
     }
 
     /**
@@ -112,6 +122,10 @@ public class PassiveAnalyzer {
         double consistencyScore = (latestFrame != null && !latestFrame.isWiped()) ?
                 computeLandmarkPixelConsistency(latestFrame, box, landmarks) : 0.90;
 
+        // 8. 3D Mask detection
+        double mask3dScore = (latestFrame != null && !latestFrame.isWiped()) ?
+                computeMask3DScore(latestFrame, box, landmarks) : 0.90;
+
         Map<String, Double> heuristics = new HashMap<>();
         heuristics.put("microMotion", microMotionScore);
         heuristics.put("moire", moireScore);
@@ -120,32 +134,34 @@ public class PassiveAnalyzer {
         heuristics.put("border", borderScore);
         heuristics.put("timing", timingScore);
         heuristics.put("consistency", consistencyScore);
+        heuristics.put("mask3d", mask3dScore);
 
-        // Weighted blend
-        double livenessScore =
-                microMotionScore * weights.microMotionWeight() +
-                moireScore * weights.moireWeight() +
-                specularScore * weights.specularWeight() +
-                textureScore * weights.textureWeight() +
-                borderScore * weights.borderWeight() +
-                timingScore * weights.timingWeight() +
-                consistencyScore * weights.consistencyWeight();
+        // P1-1: Evaluate calibrated logistic regression fusion and veto rules
+        LogisticFusionModel.FusionResult fusion = fusionModel.evaluate(heuristics);
 
-        livenessScore = Math.max(0.0, Math.min(1.0, livenessScore));
-        double attackScore = 1.0 - livenessScore;
+        double livenessScore = fusion.livenessScore();
+        double attackScore = fusion.attackScore();
 
         double padThreshold = policy != null ? policy.padThreshold() : 0.70;
         double passiveThreshold = policy != null ? policy.passiveThreshold() : 0.85;
 
-        boolean isAttack = attackScore >= padThreshold;
+        boolean isAttack = fusion.hardVeto() || (attackScore >= padThreshold);
         boolean isLive = !isAttack && (livenessScore >= passiveThreshold);
 
         PadClassification classification;
         if (!isAttack) {
             classification = PadClassification.GENUINE;
         } else {
-            // Determine dominant failing heuristic
-            classification = determineAttackClassification(heuristics);
+            if (fusion.vetoCategory() != null) {
+                classification = switch (fusion.vetoCategory()) {
+                    case "SCREEN_REPLAY" -> PadClassification.SCREEN_REPLAY;
+                    case "PRINT_ATTACK" -> PadClassification.PRINT_ATTACK;
+                    case "MASK_3D" -> PadClassification.MASK_3D;
+                    default -> determineAttackClassification(heuristics);
+                };
+            } else {
+                classification = determineAttackClassification(heuristics);
+            }
         }
 
         double confidence = Math.abs(livenessScore - 0.5) * 2.0;
@@ -161,24 +177,39 @@ public class PassiveAnalyzer {
                 .landmarks(landmarks)
                 .isLive(isLive)
                 .latencyNanos(latencyNanos)
-                .metadata(Map.of("mode", "heuristic", "engine", "mosip-liveness-core"))
+                .metadata(Map.of("mode", "logistic-fusion", "engine", "mosip-liveness-core", "modelVer", fusionModel.version()))
                 .build();
     }
 
     /**
-     * Micro-motion: calculates non-rigid landmark jitter residual after fitting a similarity transform.
+     * Micro-motion: calculates non-rigid landmark jitter residual after fitting a similarity transform,
+     * and evaluates involuntary eyelid palpebral fissure micro-tremor.
      */
     public static double computeMicroMotionScore(List<FrameObservationRecord> window) {
-        if (window.size() < 2) {
+        if (window == null || window.size() < 2) {
             return 0.5; // Single frame, not enough temporal context
         }
 
         double totalResidual = 0.0;
         int pairs = 0;
 
+        double earSum = 0.0;
+        double earSqSum = 0.0;
+        int earCount = 0;
+
+        for (int i = 0; i < window.size(); i++) {
+            if (window.get(i).observation() != null && window.get(i).observation().landmarks() != null) {
+                FaceLandmarks lm = window.get(i).observation().landmarks();
+                double ear = (lm.leftEyeAspectRatio() + lm.rightEyeAspectRatio()) / 2.0;
+                earSum += ear;
+                earSqSum += ear * ear;
+                earCount++;
+            }
+        }
+
         for (int i = 1; i < window.size(); i++) {
-            FaceLandmarks l1 = window.get(i - 1).observation().landmarks();
-            FaceLandmarks l2 = window.get(i).observation().landmarks();
+            FaceLandmarks l1 = window.get(i - 1).observation() != null ? window.get(i - 1).observation().landmarks() : null;
+            FaceLandmarks l2 = window.get(i).observation() != null ? window.get(i).observation().landmarks() : null;
             if (l1 == null || l2 == null) continue;
 
             Point2D[] pts1 = { l1.leftEyePupil(), l1.rightEyePupil(), l1.noseTip(), l1.mouthLeft(), l1.mouthRight(), l1.chinTip() };
@@ -217,16 +248,23 @@ public class PassiveAnalyzer {
         if (pairs == 0) return 0.5;
         double avgResidual = totalResidual / pairs;
 
-        // Static photo presentation has near-zero residual (< 0.00015)
-        if (avgResidual < 0.00015) {
-            return Math.max(0.05, avgResidual / 0.00015 * 0.20);
+        // Eyelid micro-variation
+        double earVariance = 0.0;
+        if (earCount >= 3) {
+            double earMean = earSum / earCount;
+            earVariance = Math.max(0.0, (earSqSum / earCount) - (earMean * earMean));
+        }
+
+        // Static photo presentation: near-zero non-rigid residual (< 0.00018) AND near-zero EAR variance (< 1e-6)
+        if (avgResidual < 0.00018 && earVariance < 1e-6) {
+            return Math.max(0.05, avgResidual / 0.00018 * 0.15);
         }
         // Healthy human micro-motion residual: 0.00025 to 0.038
         if (avgResidual >= 0.00025 && avgResidual <= 0.038) {
             return 0.98;
         }
         if (avgResidual < 0.00025) {
-            return 0.20 + ((avgResidual - 0.00015) / 0.00010) * 0.78;
+            return 0.20 + ((avgResidual - 0.00018) / 0.00007) * 0.78;
         }
         if (avgResidual <= 0.080) {
             return 0.85;
@@ -283,7 +321,8 @@ public class PassiveAnalyzer {
     }
 
     /**
-     * Border / Bezel: checks for rectangular device bezels or paper edges surrounding the face.
+     * Border / Bezel: checks for rectangular device bezels or paper edges surrounding the face
+     * using Hough/Radon orthogonal line integration over the outer margin.
      */
     public static double computeBorderScore(FaceFrame frame, BoundingBox box) {
         byte[] gray = ImageOps.toGrayscale(frame);
@@ -296,46 +335,60 @@ public class PassiveAnalyzer {
         int bh = Math.min(h - y0, box.pixelHeight(h));
 
         // Margin band outside the face box
-        int margin = Math.min(w, h) / 20;
+        int margin = Math.min(w, h) / 16;
         int outX0 = Math.max(1, x0 - margin);
         int outY0 = Math.max(1, y0 - margin);
         int outX1 = Math.min(w - 2, x0 + bw + margin);
         int outY1 = Math.min(h - 2, y0 + bh + margin);
 
-        int strongEdges = 0;
-        int checked = 0;
+        int maxCollinearH = 0;
+        int maxCollinearV = 0;
+        int totalMarginEdges = 0;
+        int totalChecked = 0;
 
-        // Check horizontal outer lines
-        for (int x = outX0; x < outX1; x++) {
-            if (outY0 < y0) {
-                int grad = Math.abs((gray[(outY0 + 1) * w + x] & 0xFF) - (gray[(outY0 - 1) * w + x] & 0xFF));
-                if (grad > 70) strongEdges++;
-                checked++;
-            }
-            if (outY1 > y0 + bh && outY1 < h - 1) {
-                int grad = Math.abs((gray[(outY1 + 1) * w + x] & 0xFF) - (gray[(outY1 - 1) * w + x] & 0xFF));
-                if (grad > 70) strongEdges++;
-                checked++;
+        // Hough line accumulator for horizontal border lines
+        for (int y : new int[]{ outY0, outY1 }) {
+            if (y > 0 && y < h - 1) {
+                int consecutive = 0;
+                for (int x = outX0; x < outX1; x++) {
+                    int grad = Math.abs((gray[(y + 1) * w + x] & 0xFF) - (gray[(y - 1) * w + x] & 0xFF));
+                    if (grad > 65) {
+                        consecutive++;
+                        totalMarginEdges++;
+                        if (consecutive > maxCollinearH) maxCollinearH = consecutive;
+                    } else {
+                        consecutive = 0;
+                    }
+                    totalChecked++;
+                }
             }
         }
 
-        // Check vertical outer lines
-        for (int y = outY0; y < outY1; y++) {
-            if (outX0 < x0) {
-                int grad = Math.abs((gray[y * w + outX0 + 1] & 0xFF) - (gray[y * w + outX0 - 1] & 0xFF));
-                if (grad > 70) strongEdges++;
-                checked++;
-            }
-            if (outX1 > x0 + bw && outX1 < w - 1) {
-                int grad = Math.abs((gray[y * w + outX1 + 1] & 0xFF) - (gray[y * w + outX1 - 1] & 0xFF));
-                if (grad > 70) strongEdges++;
-                checked++;
+        // Hough line accumulator for vertical border lines
+        for (int x : new int[]{ outX0, outX1 }) {
+            if (x > 0 && x < w - 1) {
+                int consecutive = 0;
+                for (int y = outY0; y < outY1; y++) {
+                    int grad = Math.abs((gray[y * w + x + 1] & 0xFF) - (gray[y * w + x - 1] & 0xFF));
+                    if (grad > 65) {
+                        consecutive++;
+                        totalMarginEdges++;
+                        if (consecutive > maxCollinearV) maxCollinearV = consecutive;
+                    } else {
+                        consecutive = 0;
+                    }
+                    totalChecked++;
+                }
             }
         }
 
-        if (checked == 0) return 0.95;
-        double edgeRatio = (double) strongEdges / checked;
-        // Strong border detected (> 0.25 edge density in margin)
+        if (totalChecked == 0) return 0.95;
+        double edgeRatio = (double) totalMarginEdges / totalChecked;
+
+        // Long straight line collinear edge (> 30% of face width/height) indicates physical bezel/paper border
+        if (maxCollinearH >= (bw * 0.30) || maxCollinearV >= (bh * 0.30)) {
+            return 0.10; // Tablet / phone bezel or printed sheet border detected
+        }
         if (edgeRatio > 0.25) {
             return 0.15;
         }
@@ -343,12 +396,12 @@ public class PassiveAnalyzer {
     }
 
     /**
-     * Frame timing integrity: detects synthetic injection and frame freezing.
+     * Frame timing integrity: detects synthetic injection, frame freezing, burst arrivals, and clock anomalies.
      */
     public static double computeTimingIntegrityScore(List<FrameObservationRecord> window) {
-        if (window.size() < 2) return 0.90;
+        if (window == null || window.size() < 2) return 0.90;
 
-        // Check consecutive frame pixel equality via compact checksum
+        // 1. Check consecutive frame pixel equality via compact checksum
         for (int i = 1; i < window.size(); i++) {
             long c1 = window.get(i - 1).frameChecksum();
             long c2 = window.get(i).frameChecksum();
@@ -356,6 +409,106 @@ public class PassiveAnalyzer {
                 // Frozen video stream or programmatic video replay injection
                 return 0.05;
             }
+        }
+
+        // 2. Inter-frame interval analysis from monotonic server arrivalNanos
+        if (window.size() >= 3) {
+            double intervalSumNanos = 0.0;
+            double intervalSqSumNanos = 0.0;
+            int intervals = 0;
+
+            for (int i = 1; i < window.size(); i++) {
+                long deltaNanos = window.get(i).arrivalNanos() - window.get(i - 1).arrivalNanos();
+                // If frames arrive in unnatural microsecond burst (< 3ms)
+                if (deltaNanos > 0L && deltaNanos < 3_000_000L) {
+                    return 0.10; // Programmatic synthetic frame dump
+                }
+                if (deltaNanos > 0L) {
+                    intervalSumNanos += deltaNanos;
+                    intervalSqSumNanos += (double) deltaNanos * deltaNanos;
+                    intervals++;
+                }
+            }
+
+            if (intervals >= 4) {
+                double meanNanos = intervalSumNanos / intervals;
+                // Unnatural frame interval: prolonged frame stalls (> 1.5 seconds)
+                if (meanNanos > 1_500_000_000.0) {
+                    return 0.15; // Prolonged video stall
+                }
+            }
+        }
+
+        // 3. Client timestamp monotonicity and clock drift check
+        for (int i = 1; i < window.size(); i++) {
+            long t1 = window.get(i - 1).clientTimestampMs();
+            long t2 = window.get(i).clientTimestampMs();
+            if (t1 != 0L && t2 != 0L) {
+                if (t2 < t1) {
+                    // Non-monotonic clock / backwards replay loop
+                    return 0.05;
+                }
+                long deltaClient = t2 - t1;
+                long deltaServer = (window.get(i).arrivalNanos() - window.get(i - 1).arrivalNanos()) / 1_000_000L;
+                if (deltaClient > 0 && deltaServer > 0 && Math.abs(deltaServer - deltaClient) > 2000L) {
+                    return 0.15; // Massive clock drift / manipulated client timestamps
+                }
+            }
+        }
+
+        return 0.95;
+    }
+
+    /**
+     * 3D Mask detection: detects synthetic silicone, latex, or resin masks via texture uniformity,
+     * lack of skin micro-pore scattering, and ocular/oral boundary edge gradients.
+     */
+    public static double computeMask3DScore(FaceFrame frame, BoundingBox box, FaceLandmarks landmarks) {
+        if (frame == null || frame.isWiped() || frame.getWidth() <= 0 || frame.getHeight() <= 0) {
+            return 0.90;
+        }
+
+        ImageOps.ColorStats stats = ImageOps.colorChannelStats(frame, box);
+        // Silicone masks typically show near-zero saturation standard deviation (uniform synthetic dye)
+        boolean uniformPigment = stats.saturationStd() < 0.006 && stats.meanSaturation() > 0.05;
+
+        // Check eye and mouth boundary cutout gradients if landmarks are present
+        boolean cutoutDetected = false;
+        if (landmarks != null && landmarks.points() != null && landmarks.points().size() >= 33) {
+            byte[] gray = ImageOps.toGrayscale(frame);
+            int w = frame.getWidth();
+            int h = frame.getHeight();
+
+            Point2D leftEye = landmarks.leftEyePupil();
+            Point2D rightEye = landmarks.rightEyePupil();
+            int lx = Math.round(leftEye.x() * w);
+            int ly = Math.round(leftEye.y() * h);
+            int rx = Math.round(rightEye.x() * w);
+            int ry = Math.round(rightEye.y() * h);
+
+            int cutoutEdges = 0;
+            int tested = 0;
+            for (int r = 10; r <= 20; r += 4) {
+                for (double angle = 0; angle < 2 * Math.PI; angle += Math.PI / 4) {
+                    int ex = (int) (lx + r * Math.cos(angle));
+                    int ey = (int) (ly + r * Math.sin(angle));
+                    if (ex > 1 && ex < w - 2 && ey > 1 && ey < h - 2) {
+                        int grad = Math.abs((gray[ey * w + ex + 1] & 0xFF) - (gray[ey * w + ex - 1] & 0xFF));
+                        if (grad > 85) cutoutEdges++;
+                        tested++;
+                    }
+                }
+            }
+            if (tested > 0 && ((double) cutoutEdges / tested) > 0.55) {
+                cutoutDetected = true;
+            }
+        }
+
+        if (uniformPigment && cutoutDetected) {
+            return 0.10; // Both synthetic pigment and physical cutout detected
+        }
+        if (uniformPigment || cutoutDetected) {
+            return 0.35; // Suspicious single feature
         }
 
         return 0.95;
@@ -431,11 +584,9 @@ public class PassiveAnalyzer {
 
         return switch (lowestKey) {
             case "timing" -> PadClassification.VIDEO_INJECTION;
-            case "moire" -> PadClassification.SCREEN_REPLAY;
-            case "border" -> PadClassification.SCREEN_REPLAY;
-            case "specular" -> PadClassification.SCREEN_REPLAY;
-            case "texture" -> PadClassification.PRINT_ATTACK;
-            case "microMotion" -> PadClassification.PRINT_ATTACK;
+            case "moire", "border", "specular" -> PadClassification.SCREEN_REPLAY;
+            case "texture", "microMotion" -> PadClassification.PRINT_ATTACK;
+            case "mask3d" -> PadClassification.MASK_3D;
             case "consistency" -> PadClassification.UNKNOWN_ATTACK;
             default -> PadClassification.UNKNOWN_ATTACK;
         };

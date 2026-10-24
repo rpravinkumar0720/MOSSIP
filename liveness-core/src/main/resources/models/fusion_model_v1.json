@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "name": "logistic-regression-pad-fusion",
+  "intercept": -6.50,
+  "weights": {
+    "microMotion": 2.20,
+    "moire": 2.10,
+    "specular": 1.90,
+    "texture": 1.80,
+    "border": 1.60,
+    "timing": 2.50,
+    "consistency": 1.70,
+    "mask3d": 1.80
+  },
+  "vetoRules": {
+    "screenThreshold": 0.20,
+    "screenMinFailures": 2,
+    "printThreshold": 0.20,
+    "printMinFailures": 2,
+    "totalMinFailures": 3
+  }
+}

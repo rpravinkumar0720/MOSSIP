@@ -158,4 +158,46 @@ class PassiveAnalyzerTest {
 
         assertThat(result.padResult().heuristics().get("consistency")).isLessThan(0.3);
     }
+
+    @Test
+    @DisplayName("P1-1: Multi-vector screen failures trigger hard-veto SCREEN_REPLAY attack")
+    void testHardVetoScreenAttack() {
+        LogisticFusionModel model = LogisticFusionModel.loadDefault();
+        // Moire, specular, border, and timing all failing (< 0.20), while rest are high
+        java.util.Map<String, Double> heuristics = new java.util.HashMap<>();
+        heuristics.put("moire", 0.05);
+        heuristics.put("specular", 0.05);
+        heuristics.put("border", 0.15);
+        heuristics.put("timing", 0.05);
+        heuristics.put("microMotion", 0.98);
+        heuristics.put("texture", 0.95);
+        heuristics.put("consistency", 0.95);
+        heuristics.put("mask3d", 0.95);
+
+        LogisticFusionModel.FusionResult fusion = model.evaluate(heuristics);
+
+        assertThat(fusion.hardVeto()).isTrue();
+        assertThat(fusion.vetoCategory()).isEqualTo("SCREEN_REPLAY");
+        assertThat(fusion.attackScore()).isGreaterThanOrEqualTo(0.90);
+        assertThat(fusion.livenessScore()).isLessThanOrEqualTo(0.10);
+    }
+
+    @Test
+    @DisplayName("P1-2: Microsecond frame burst (<3ms) triggers synthetic timing anomaly")
+    void testSyntheticBurstTimingDetection() {
+        List<FrameObservationRecord> window = new ArrayList<>();
+        BoundingBox box = BoundingBox.of(0.2f, 0.2f, 0.8f, 0.8f, 0.95f);
+        FaceLandmarks lm = createLandmarksWithJitter(0.002f, 0.002f);
+        FaceObservation obs = FaceObservation.singleFace(box, lm, 0.95);
+
+        long baseNanos = 1_000_000_000L;
+        // Frames arriving at 1ms intervals (synthetic burst / bot injection)
+        for (int i = 0; i < 4; i++) {
+            window.add(new FrameObservationRecord(i + 1, obs, baseNanos + (i * 1_000_000L), 1000 + i));
+        }
+
+        double score = PassiveAnalyzer.computeTimingIntegrityScore(window);
+        assertThat(score).isLessThanOrEqualTo(0.15);
+    }
 }
+

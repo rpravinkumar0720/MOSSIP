@@ -21,6 +21,9 @@ let activeChallengeTimer = null;
 let localAuditEvents = [];
 let reconnectAttempts = 0;
 let adminToken = sessionStorage.getItem('mosip_admin_token') || (new URLSearchParams(window.location.search)).get('adminToken') || '';
+let activeChallengeToken = null;
+let virtualCameraDetected = false;
+let colorFlashInterval = null;
 
 // Localization Strings for Web UI
 const UI_STRINGS = {
@@ -234,6 +237,16 @@ async function initCamera() {
     audio: false
   });
 
+  const tracks = stream.getVideoTracks();
+  if (tracks && tracks.length > 0) {
+    const label = (tracks[0].label || '').toLowerCase();
+    const virtualKeywords = ['obs', 'virtual', 'manycam', 'v4l2loopback', 'fake', 'droidcam', 'camo', 'unity'];
+    virtualCameraDetected = virtualKeywords.some(kw => label.includes(kw));
+    if (virtualCameraDetected) {
+      console.warn('Virtual camera indicator detected in track label:', tracks[0].label);
+    }
+  }
+
   video.srcObject = stream;
   await new Promise(resolve => {
     video.onloadedmetadata = () => {
@@ -345,7 +358,11 @@ async function processVideoFrame(timestamp) {
 
       if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
         const rawPoints = results.faceLandmarks[0];
-        normalizedLandmarks = rawPoints.map(p => [p.x, p.y, p.z || 0]);
+        normalizedLandmarks = rawPoints.map(p => [
+          Math.round(p.x * 10000) / 10000,
+          Math.round(p.y * 10000) / 10000,
+          Math.round((p.z || 0) * 10000) / 10000
+        ]);
         drawFaceMeshPreview(overlayCtx, rawPoints, overlayCanvas.width, overlayCanvas.height);
       }
     } catch (e) {
@@ -381,15 +398,15 @@ function drawFaceMeshPreview(ctx, points, width, height) {
 }
 
 function captureAndSendFrame(landmarks) {
-  const targetW = 400;
-  const targetH = Math.round(targetW * (video.videoHeight / video.videoWidth));
+  const targetW = 640;
+  const targetH = 480;
 
   captureCanvas.width = targetW;
   captureCanvas.height = targetH;
 
   // IMPORTANT: Un-mirrored raw pixels sent to server decisions
   captureCtx.drawImage(video, 0, 0, targetW, targetH);
-  const jpegB64 = captureCanvas.toDataURL('image/jpeg', 0.7);
+  const jpegB64 = captureCanvas.toDataURL('image/jpeg', 0.85);
 
   const payload = {
     type: 'frame',
@@ -400,6 +417,12 @@ function captureAndSendFrame(landmarks) {
     width: targetW,
     height: targetH
   };
+  if (activeChallengeToken) {
+    payload.challengeToken = activeChallengeToken;
+  }
+  if (virtualCameraDetected) {
+    payload.virtualCameraHint = true;
+  }
 
   websocket.send(JSON.stringify(payload));
 }
@@ -415,6 +438,8 @@ function handleServerMessage(msg) {
         document.getElementById('challengeCard').classList.remove('hidden');
       } else {
         document.getElementById('challengeCard').classList.add('hidden');
+        activeChallengeToken = null;
+        stopColorFlashAnimation();
       }
       break;
 
@@ -441,10 +466,13 @@ function handleServerMessage(msg) {
       break;
 
     case 'challenge':
+      activeChallengeToken = msg.challengeToken || msg.challengeId || null;
       showChallenge(msg.challengeType, msg.prompt, msg.timeoutMs || 4000);
       break;
 
     case 'decision':
+      activeChallengeToken = null;
+      stopColorFlashAnimation();
       handleDecision(msg);
       break;
 
@@ -495,6 +523,38 @@ function showChallenge(type, prompt, timeoutMs) {
     fill.style.transition = `width ${timeoutMs}ms linear`;
     fill.style.width = '0%';
   }, 50);
+
+  if (type === 'COLOR_FLASH') {
+    startColorFlashAnimation(timeoutMs);
+  } else {
+    stopColorFlashAnimation();
+  }
+}
+
+function startColorFlashAnimation(timeoutMs) {
+  stopColorFlashAnimation();
+  const guide = document.getElementById('ovalGuide');
+  const colors = ['rgba(239, 68, 68, 0.45)', 'rgba(34, 197, 94, 0.45)', 'rgba(59, 130, 246, 0.45)', 'rgba(234, 179, 8, 0.45)'];
+  let colorIdx = 0;
+  colorFlashInterval = setInterval(() => {
+    if (guide) {
+      guide.style.boxShadow = `0 0 0 9999px ${colors[colorIdx]}`;
+      guide.style.borderColor = colors[colorIdx];
+    }
+    colorIdx = (colorIdx + 1) % colors.length;
+  }, 350);
+}
+
+function stopColorFlashAnimation() {
+  if (colorFlashInterval) {
+    clearInterval(colorFlashInterval);
+    colorFlashInterval = null;
+  }
+  const guide = document.getElementById('ovalGuide');
+  if (guide) {
+    guide.style.boxShadow = '';
+    guide.style.borderColor = '';
+  }
 }
 
 function getChallengeIcon(type) {
@@ -505,6 +565,7 @@ function getChallengeIcon(type) {
     case 'TURN_RIGHT': return '➡️';
     case 'LOOK_UP': return '⬆️';
     case 'NOD_HEAD': return '↕️';
+    case 'COLOR_FLASH': return '🌈';
     default: return '👤';
   }
 }

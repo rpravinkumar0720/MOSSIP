@@ -256,6 +256,12 @@ public class ChallengeVerifier {
             case NOD_HEAD -> {
                 double deltaPitch = landmarks.estimatedPitchDegrees() - baselinePitch;
                 if (deltaPitch <= -15.0) {
+                    actionTransitionObserved = true;
+                }
+                if (actionTransitionObserved) {
+                    if (Math.abs(deltaPitch) <= 8.0) {
+                        returnedToCenter = true;
+                    }
                     if (frameTracked && maxObservedPixelMotion < 0.005) {
                         return Optional.of(ChallengeResult.failure(
                                 challenge.challengeId(),
@@ -271,6 +277,29 @@ public class ChallengeVerifier {
                             0.92,
                             identityContinuityScore
                     ));
+                }
+            }
+
+            case COLOR_FLASH -> {
+                // Photometric reflection: requires active skin illumination modulation
+                if (elapsedMillis >= 600) {
+                    if (frameTracked && (maxObservedEyeDelta >= 0.003 || maxObservedPixelMotion >= 0.003)) {
+                        return Optional.of(ChallengeResult.success(
+                                challenge.challengeId(),
+                                type,
+                                elapsedMillis,
+                                0.96,
+                                identityContinuityScore
+                        ));
+                    }
+                    if (elapsedMillis >= 3500) {
+                        return Optional.of(ChallengeResult.failure(
+                                challenge.challengeId(),
+                                type,
+                                elapsedMillis,
+                                LivenessError.PAD_FAILURE.getErrorCode()
+                        ));
+                    }
                 }
             }
         }

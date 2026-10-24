@@ -20,7 +20,10 @@ public enum ChallengeType {
     LOOK_UP("Please tilt your head up", 5000),
 
     /** Prompt resident to nod head downwards. */
-    NOD_HEAD("Please nod your head", 5000);
+    NOD_HEAD("Please nod your head", 5000),
+
+    /** Photometric reflection challenge: Observe facial skin response to randomized screen color flashes. */
+    COLOR_FLASH("Please watch the screen colors", 4500);
 
     private final String defaultPrompt;
     private final long defaultTimeoutMillis;

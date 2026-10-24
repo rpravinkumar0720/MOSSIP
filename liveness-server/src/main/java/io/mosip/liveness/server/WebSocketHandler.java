@@ -84,6 +84,8 @@ public class WebSocketHandler {
         long lastFrameNanos = 0L;
         long lastActivityMillis = System.currentTimeMillis();
         long totalBytesReceived = 0L;
+        long lastSeq = -1L;
+        long lastTsMs = 0L;
 
         SocketSessionState(WsConnectContext ws, String lang, WorkflowType workflow,
                            String clientIdentity, String deviceId, boolean judgeMode, String clientIp) {
@@ -290,7 +292,36 @@ public class WebSocketHandler {
             rgbBytes[i * 3 + 2] = (byte) (p & 0xFF);
         }
 
-        long seq = root.path("seq").asLong(0L);
+        long seq = root.path("seq").asLong(-1L);
+        long tsMs = root.path("tsMs").asLong(0L);
+
+        // P1-4: Reject stale/duplicate seq and non-monotonic tsMs
+        if (seq >= 0 && state.lastSeq >= 0 && seq <= state.lastSeq) {
+            log.warn("Dropped stale/duplicate frame sequence {} (lastSeq={})", seq, state.lastSeq);
+            return;
+        }
+        if (seq >= 0) {
+            state.lastSeq = seq;
+        }
+
+        if (tsMs > 0 && state.lastTsMs > 0 && tsMs < state.lastTsMs) {
+            log.warn("Dropped non-monotonic frame timestamp {} ms (lastTsMs={})", tsMs, state.lastTsMs);
+            return;
+        }
+        if (tsMs > 0) {
+            state.lastTsMs = tsMs;
+        }
+
+        // P1-4: Challenge token echo verification
+        if (state.session != null && state.session.getCurrentChallenge() != null) {
+            Challenge activeCh = state.session.getCurrentChallenge();
+            String echoToken = root.path("challengeToken").asText(root.path("challengeId").asText(""));
+            if (!echoToken.isEmpty() && !activeCh.nonce().equals(echoToken) && !activeCh.challengeId().equals(echoToken)) {
+                log.warn("Frame rejected during active challenge: token '{}' does not match active challenge '{}'",
+                        echoToken, activeCh.challengeId());
+                return;
+            }
+        }
 
         // Parse landmarks if provided
         List<Point2D> points = parseLandmarks(root.path("landmarks"));
@@ -435,12 +466,14 @@ public class WebSocketHandler {
             @Override
             public void onChallengeIssued(LivenessSession session, Challenge challenge) {
                 String prompt = LocalizationService.getChallengePrompt(challenge.type(), state.lang);
-                sendJson(state.ws, Map.of(
-                        "type", "challenge",
-                        "challengeType", challenge.type().name(),
-                        "prompt", prompt,
-                        "timeoutMs", challenge.timeoutMillis()
-                ));
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("type", "challenge");
+                payload.put("challengeId", challenge.challengeId());
+                payload.put("challengeType", challenge.type().name());
+                payload.put("prompt", prompt);
+                payload.put("timeoutMs", challenge.timeoutMillis());
+                payload.put("challengeToken", challenge.nonce());
+                sendJson(state.ws, payload);
             }
 
             @Override

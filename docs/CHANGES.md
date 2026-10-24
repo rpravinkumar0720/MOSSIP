@@ -63,3 +63,59 @@ This document maps all identified architectural, security, algorithmic, and pres
   - Added bounded LRU cache (1,000 sessions) and 10 MB rotation in `FileAuditSink.java`.
 - **Commit:** `feat(security): implement P0 anti-spoofing, audit signing, session auth, and lockout`
 - **Tests:** `LivenessAuditEventTest`, `AuditChainVerifierTest`
+
+---
+
+## Phase P1: Presentation Attack Detection (PAD) Quality
+
+### [P1-1] Veto + Calibrated Fusion Instead of a Plain Average
+- **Finding:** Simple weighted average allowed severe multi-vector attacks (e.g. failing moire, specular, border, timing) to register ~0.50 and evade detection when other signals were high. Post-challenge completion accepted without checking blended scores against policy thresholds. No 3D mask attack classification existed.
+- **Resolution:**
+  - Created versioned logistic regression model `fusion_model_v1.json` with calibrated feature weights and intercept.
+  - Implemented pure-Java `LogisticFusionModel.java` evaluating logistic sigmoid $\sigma(w_0 + \sum w_i x_i)$ and multi-vector hard-veto rules ($\ge 2$ screen failures $\implies$ `SCREEN_REPLAY`; zero-motion $\implies$ `PRINT_ATTACK`; frozen stream $\implies$ `VIDEO_INJECTION`; $\ge 3$ failures $\implies$ `UNKNOWN_ATTACK`).
+  - Added `computeMask3DScore` in `PassiveAnalyzer.java` and `PadClassification.MASK_3D` detecting synthetic silicone/latex pigment uniformity and cutout boundary gradients.
+  - Updated `DefaultLivenessEngine.java` to cache challenge frames, re-evaluate PAD over challenge frames, and assert `blendedScore >= policy.passiveThreshold()`.
+- **Commit:** `feat(pad): implement P1 logistic fusion, hard veto, onnx module, and active challenge hardening`
+- **Tests:** `PassiveAnalyzerTest#testHardVetoScreenAttack`, `PassiveAnalyzerTest#testStaticPhotoAttack`
+
+### [P1-2] Signal Realignment with Documented Specifications
+- **Finding:**
+  - Micro-motion excluded eyelids and lacked similarity-transform alignment.
+  - Timing checked only frozen checksums, ignoring microsecond bursts, clock drift, and synthetic timers.
+  - Moire was destroyed by downscaling 400px JPEG q0.7 to 64x64 before FFT.
+  - Border claimed Hough line transform in documentation but used a simple gradient check.
+- **Resolution:**
+  - Refined `computeMicroMotionScore` to calculate non-rigid landmark jitter residual after fitting a Procrustes-style similarity transform plus palpebral fissure EAR micro-variance.
+  - Refined `computeTimingIntegrityScore` with inter-frame arrival variance, microsecond burst rejection ($<3\text{ ms}$), prolonged stall detection ($>1.5\text{ s}$), client timestamp monotonicity, and clock drift bounds ($>2\text{ s}$).
+  - Updated `ImageOps.java` to extract native-resolution $64\times 64$ patches without downscaling before 2D FFT, preserving screen-grid frequencies. Web client sends 640x480 at $q=0.85$.
+  - Implemented Radon/Hough orthogonal collinear edge accumulator in `computeBorderScore` detecting physical bezels and paper edges.
+- **Commit:** `feat(pad): implement P1 logistic fusion, hard veto, onnx module, and active challenge hardening`
+- **Tests:** `PassiveAnalyzerTest#testSyntheticBurstTimingDetection`, `ImageOpsTest`
+
+### [P1-3] Real Neural PAD Optional Module (`liveness-onnx`)
+- **Finding:** Engine advertised `+onnx` in version string without executing inference models, and no real inference code existed in repository.
+- **Resolution:**
+  - Added Maven module `liveness-onnx` containing `UltraFaceDetector.java` (UltraFace-RFB-320 ONNX), `MiniFasNetPadAnalyzer.java` (multi-scale crop neural PAD), and `FaceEmbeddingService.java` (cosine facial embedding similarity).
+  - Created `scripts/download_models.sh` and `scripts/download_models.ps1` with SHA-256 integrity verification.
+  - Configured graceful degradation when ONNX model files are absent.
+- **Commit:** `feat(pad): implement P1 logistic fusion, hard veto, onnx module, and active challenge hardening`
+- **Tests:** `OnnxModulesTest`
+
+### [P1-4] Stronger Active Challenge & Color Flash
+- **Finding:** Challenge nonces were never validated; turn/nod passed on a single frame crossing threshold; no identity consistency check across challenge window.
+- **Resolution:**
+  - Added random `challengeToken` nonce issuing per challenge; web client echoes it on every frame; server rejects frames with mismatched tokens.
+  - Enforced frame sequence monotonicity and timestamp monotonicity in `WebSocketHandler.java`.
+  - Added hold duration and return-to-center tracking in `ChallengeVerifier.java`.
+  - Added `COLOR_FLASH` challenge type with photometric illumination reflection verification in `ChallengeVerifier.java` and animated color flash in `app.js`.
+- **Commit:** `feat(pad): implement P1 logistic fusion, hard veto, onnx module, and active challenge hardening`
+- **Tests:** `ChallengeVerifierTest`
+
+### [P1-5] Injection Hardening
+- **Finding:** Browser injection tools and virtual cameras could bypass baseline heuristics.
+- **Resolution:**
+  - Added virtual camera inspection in `app.js` checking `MediaStreamTrack.label` for virtual camera drivers (`obs`, `virtual`, `manycam`, `v4l2loopback`).
+  - Added Jetty WebSocket text message limit configuration (1 MB).
+  - Aligned repository license to `Apache License, Version 2.0`.
+- **Commit:** `feat(pad): implement P1 logistic fusion, hard veto, onnx module, and active challenge hardening`
+- **Tests:** `LivenessServerWebSocketTest`

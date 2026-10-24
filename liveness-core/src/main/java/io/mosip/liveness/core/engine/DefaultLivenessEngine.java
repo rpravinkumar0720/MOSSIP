@@ -68,6 +68,7 @@ public class DefaultLivenessEngine implements LivenessEngine {
         final LivenessSession session;
         final LivenessListener listener;
         final List<FrameObservationRecord> frameWindow = new ArrayList<>();
+        final List<FrameObservationRecord> challengeFrameWindow = new ArrayList<>();
         final List<ChallengeResult> completedChallenges = new ArrayList<>();
 
         EngineState state = EngineState.FACE_POSITIONING;
@@ -463,6 +464,13 @@ public class DefaultLivenessEngine implements LivenessEngine {
                                 ctx.latestPassiveResult, ch.promptText());
                     }
 
+                    // Record challenge frame for PAD re-evaluation
+                    long checksum = PassiveAnalyzer.computeChecksum(frame);
+                    ctx.challengeFrameWindow.add(new FrameObservationRecord(checksum, observation, arrivalNanos, System.currentTimeMillis()));
+                    if (ctx.challengeFrameWindow.size() > session.getPolicy().passiveWindowFrames()) {
+                        ctx.challengeFrameWindow.remove(0);
+                    }
+
                     // Challenge verification with server pixel corroboration
                     Optional<ChallengeResult> challengeResultOpt = ctx.currentVerifier.update(observation.landmarks(), arrivalNanos, frame);
                     if (challengeResultOpt.isEmpty()) {
@@ -481,11 +489,51 @@ public class DefaultLivenessEngine implements LivenessEngine {
                         int minRequired = session.getPolicy().minChallenges();
 
                         if (ctx.completedChallenges.size() >= minRequired) {
-                            // Verification complete!
-                            ctx.state = EngineState.DECIDED;
                             double passiveScore = ctx.latestPassiveResult != null ? ctx.latestPassiveResult.livenessScore() : 0.85;
                             double actionScore = chResult.transitionScore();
                             double blendedScore = (passiveScore * 0.6) + (actionScore * 0.4);
+
+                            // P1-1: Re-check blended score against policy threshold
+                            if (blendedScore < session.getPolicy().passiveThreshold()) {
+                                int retries = session.incrementRetry();
+                                if (retries > session.getPolicy().maxRetries()) {
+                                    return handleExceededRetries(ctx, session, effectiveClient);
+                                }
+                                String retryMsg = "Verification inconclusive; score " + String.format(java.util.Locale.ROOT, "%.2f", blendedScore)
+                                        + " below threshold (attempt " + retries + " of " + (session.getPolicy().maxRetries() + 1) + ")";
+                                LivenessDecision decision = LivenessDecision.retry(session.getSessionId(), session.getWorkflow(), retryMsg, ctx.latestPassiveResult);
+                                if (ctx.listener != null) {
+                                    ctx.listener.onDecision(session, decision);
+                                }
+                                return decision;
+                            }
+
+                            // P1-1: Re-run PAD on the challenge frames
+                            if (ctx.challengeFrameWindow.size() >= 3) {
+                                PassiveLivenessResult challengePad = passiveAnalyzer.evaluateWindow(
+                                        ctx.challengeFrameWindow, frame, session.getPolicy(), quality);
+                                if (challengePad.padResult().isAttack()) {
+                                    recordAudit(ctx, AuditEventType.PAD_ATTACK_DETECTED, DecisionType.REJECTED,
+                                            challengePad.livenessScore(), challengePad.padResult().classification(),
+                                            challengePad.padResult().attackScore(), null,
+                                            LivenessError.PAD_FAILURE.getErrorCode(), Map.of("phase", "challenge_corroboration"));
+                                    int retries = session.incrementRetry();
+                                    if (retries > session.getPolicy().maxRetries()) {
+                                        return handleExceededRetries(ctx, session, effectiveClient);
+                                    }
+                                    String userMsg = LivenessError.PAD_FAILURE.getDefaultUserMessage()
+                                            + " (attempt " + retries + " of " + (session.getPolicy().maxRetries() + 1) + ")";
+                                    LivenessDecision decision = LivenessDecision.rejected(session.getSessionId(), session.getWorkflow(),
+                                            userMsg, challengePad, ctx.completedChallenges);
+                                    if (ctx.listener != null) {
+                                        ctx.listener.onDecision(session, decision);
+                                    }
+                                    return decision;
+                                }
+                            }
+
+                            // Verification complete!
+                            ctx.state = EngineState.DECIDED;
 
                             recordAudit(ctx, AuditEventType.FINAL_DECISION, DecisionType.ACCEPTED,
                                     blendedScore, PadClassification.GENUINE, 0.0, null, null, Map.of());

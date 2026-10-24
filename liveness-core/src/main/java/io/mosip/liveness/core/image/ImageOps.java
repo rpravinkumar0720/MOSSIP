@@ -368,11 +368,21 @@ public final class ImageOps {
         BoundingBox faceBox = box != null ? box : BoundingBox.of(0.2f, 0.2f, 0.8f, 0.8f, 1.0f);
         int cropW = Math.max(1, faceBox.pixelWidth(w));
         int cropH = Math.max(1, faceBox.pixelHeight(h));
-        byte[] cropped = cropRegion(gray, w, h, faceBox);
-
-        // Downscale to 64x64 power-of-2 patch
+        // Extract native-resolution 64x64 patch without downscaling when face ROI is large enough
         final int N = 64;
-        byte[] patch = downscale(cropped, cropW, cropH, N, N);
+        byte[] patch = new byte[N * N];
+        if (cropW >= N && cropH >= N) {
+            int cx = Math.max(0, faceBox.pixelLeft(w)) + cropW / 2;
+            int cy = Math.max(0, faceBox.pixelTop(h)) + cropH / 2;
+            int px0 = Math.max(0, Math.min(w - N, cx - N / 2));
+            int py0 = Math.max(0, Math.min(h - N, cy - N / 2));
+            for (int y = 0; y < N; y++) {
+                System.arraycopy(gray, (py0 + y) * w + px0, patch, y * N, N);
+            }
+        } else {
+            byte[] cropped = cropRegion(gray, w, h, faceBox);
+            patch = downscale(cropped, cropW, cropH, N, N);
+        }
 
         double[][] real = new double[N][N];
         double[][] imag = new double[N][N];
