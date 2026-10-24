@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MOSIP Face Liveness & PAD Verification</title>
+  <meta name="description" content="Production-ready MOSIP biometric face liveness and presentation attack detection (PAD) system">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-badge">MOSIP</div>
+        <div class="brand-title">
+          <h1>Face Liveness & PAD</h1>
+          <span class="sub-title">ISO/IEC 19794-5 & ISO 30107 Compliance Engine</span>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <div class="control-group">
+          <label for="workflowSelect" id="lblWorkflow">Workflow:</label>
+          <select id="workflowSelect" class="custom-select">
+            <option value="RESIDENT_AUTH">Resident Auth</option>
+            <option value="RESIDENT_ENROLLMENT">Resident Enrollment</option>
+            <option value="OPERATOR_AUTH">Operator Auth</option>
+            <option value="SUPERVISOR_AUTH">Supervisor Auth</option>
+          </select>
+        </div>
+
+        <div class="control-group">
+          <label for="langToggle" id="lblLang">Language:</label>
+          <button id="langToggle" class="lang-btn" aria-label="Toggle language">
+            <span class="lang-code active" data-lang="en">EN</span>
+            <span class="lang-divider">/</span>
+            <span class="lang-code" data-lang="ta">தமிழ்</span>
+          </button>
+        </div>
+
+        <div class="status-indicator" id="serverStatusIndicator" title="Server Connection">
+          <span class="status-dot"></span>
+          <span class="status-label" id="serverStatusLabel">Connecting...</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content Grid -->
+    <main class="main-layout">
+      <!-- Camera & Verification Stage -->
+      <section class="camera-section">
+        <div class="camera-viewport-card">
+          <div class="video-wrapper">
+            <video id="webcam" autoplay playsinline muted></video>
+            <canvas id="overlayCanvas"></canvas>
+            
+            <!-- Hidden processing canvas -->
+            <canvas id="captureCanvas" style="display:none;"></canvas>
+
+            <!-- Guide Overlay -->
+            <div class="oval-guide" id="ovalGuide">
+              <div class="guide-corners"></div>
+            </div>
+
+            <!-- On-Screen Prompt Banner -->
+            <div class="prompt-banner" id="promptBanner">
+              <div class="prompt-icon" id="promptIcon">👤</div>
+              <div class="prompt-text" id="promptText">Position your face in the oval</div>
+            </div>
+
+            <!-- Challenge Indicator -->
+            <div class="challenge-card hidden" id="challengeCard">
+              <div class="challenge-icon" id="challengeIcon">👁️</div>
+              <div class="challenge-details">
+                <span class="challenge-title" id="challengeTitle">Action Required</span>
+                <span class="challenge-prompt" id="challengePrompt">Please blink</span>
+              </div>
+              <div class="challenge-timer-bar">
+                <div class="challenge-timer-fill" id="challengeTimerFill"></div>
+              </div>
+            </div>
+
+            <!-- Passive Progress Bar -->
+            <div class="passive-progress-container" id="passiveProgressContainer">
+              <div class="passive-progress-label" id="passiveProgressLabel">Passive Liveness 0/5</div>
+              <div class="passive-progress-track">
+                <div class="passive-progress-fill" id="passiveProgressFill"></div>
+              </div>
+            </div>
+
+            <!-- Decision Overlay -->
+            <div class="decision-overlay hidden" id="decisionOverlay">
+              <div class="decision-modal" id="decisionModal">
+                <div class="decision-icon" id="decisionIcon">✓</div>
+                <h2 class="decision-title" id="decisionTitle">Verification Successful</h2>
+                <p class="decision-message" id="decisionMessage">Face verification completed.</p>
+                <div class="decision-stats" id="decisionStats">
+                  <div class="stat-item">
+                    <span class="stat-label">Score</span>
+                    <span class="stat-value" id="decisionScore">0.96</span>
+                  </div>
+                  <div class="stat-item">
+                    <span class="stat-label">Session ID</span>
+                    <span class="stat-value code-font" id="decisionSessionId">-</span>
+                  </div>
+                </div>
+                <div class="decision-actions">
+                  <button id="btnRetry" class="btn btn-primary">Start New Session</button>
+                  <button id="btnViewAuditFromModal" class="btn btn-secondary">Inspect Audit Trail</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Fallback / Error Overlay -->
+            <div class="camera-error-overlay hidden" id="cameraErrorOverlay">
+              <div class="error-modal">
+                <div class="error-icon">⚠️</div>
+                <h3 id="cameraErrorTitle">Camera Access Required</h3>
+                <p id="cameraErrorMessage">Please allow camera permissions to begin face verification.</p>
+                <button id="btnRetryCamera" class="btn btn-primary">Try Again</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Real-Time Metrics Toolbar -->
+          <div class="metrics-bar">
+            <div class="metric-pill" id="pillCompliance">
+              <span class="pill-dot"></span>
+              <span class="pill-label">Quality:</span>
+              <span class="pill-value" id="valCompliance">Checking...</span>
+            </div>
+            <div class="metric-pill">
+              <span class="pill-label">Sharpness:</span>
+              <span class="pill-value" id="valSharpness">-</span>
+            </div>
+            <div class="metric-pill">
+              <span class="pill-label">Pose (Y/P):</span>
+              <span class="pill-value" id="valPose">0° / 0°</span>
+            </div>
+            <div class="metric-pill">
+              <span class="pill-label">Luma:</span>
+              <span class="pill-value" id="valLuma">-</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Sidebar Tabs: Policy, Audit Trail, Diagnostics -->
+      <aside class="sidebar-section">
+        <div class="tab-header">
+          <button class="tab-btn active" data-tab="tabAudit" id="tabBtnAudit">Audit Chain</button>
+          <button class="tab-btn" data-tab="tabPolicy" id="tabBtnPolicy">Policy</button>
+          <button class="tab-btn hidden" data-tab="tabDiag" id="tabBtnDiag">Diagnostics</button>
+        </div>
+
+        <div class="tab-content active" id="tabAudit">
+          <div class="audit-panel-header">
+            <div>
+              <h3>Cryptographic Audit Chain</h3>
+              <p class="section-desc">SHA-256 forward-linked event trail</p>
+            </div>
+            <div class="audit-actions">
+              <button id="btnVerifyChain" class="btn btn-sm btn-verify" title="Verify cryptographic linkage">Verify Chain</button>
+              <button id="btnTamperChain" class="btn btn-sm btn-tamper" title="Simulate adversary modifying audit payload">Tamper Event</button>
+            </div>
+          </div>
+
+          <div class="verification-badge hidden" id="chainVerificationBadge">
+            <span class="badge-icon">✓</span>
+            <span class="badge-text" id="chainVerificationText">Chain Valid</span>
+          </div>
+
+          <div class="table-container">
+            <table class="audit-table">
+              <thead>
+                <tr>
+                  <th>Event Type</th>
+                  <th>Decision</th>
+                  <th>Hash Linkage</th>
+                </tr>
+              </thead>
+              <tbody id="auditTableBody">
+                <tr class="empty-row"><td colspan="3">No events recorded yet. Start capture.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="tab-content" id="tabPolicy">
+          <h3>Effective Policy Settings</h3>
+          <p class="section-desc">Loaded from server policy registry</p>
+          <div class="policy-details" id="policyDetailsContainer">
+            <div class="policy-loading">Fetching policy parameters...</div>
+          </div>
+        </div>
+
+        <div class="tab-content" id="tabDiag">
+          <h3>PAD Diagnostic Channel</h3>
+          <p class="section-desc">Live presentation attack heuristics</p>
+          <div class="diag-container" id="diagContainer">
+            <div class="diag-empty">Diagnostic telemetry will appear when enabled (--diagnostic).</div>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <span>MOSIP Biometrics | Zero-biometric disk footprint | RAM frame wiping</span>
+      <div class="footer-links">
+        <a href="/api/health" target="_blank" class="footer-link">✓ API Health</a>
+        <a href="/api/policy/RESIDENT_AUTH" target="_blank" class="footer-link">📋 Resident Auth Policy</a>
+        <a href="/api/audit/verify" target="_blank" class="footer-link">🛡️ Audit Chain Verification</a>
+        <a href="collect.html" class="footer-link">Dataset Collector</a>
+      </div>
+    </footer>
+  </div>
+
+  <!-- MediaPipe Tasks Vision CDN -->
+  <script type="module" src="app.js"></script>
+</body>
+</html>

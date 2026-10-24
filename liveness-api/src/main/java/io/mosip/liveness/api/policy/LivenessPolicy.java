@@ -66,6 +66,39 @@ public record LivenessPolicy(
     }
 
     /**
+     * Default policy for Resident Authentication (passive-first, rapid verification).
+     */
+    public static LivenessPolicy defaultResidentAuth() {
+        return builder()
+                .passiveThreshold(0.80)
+                .passiveWindowFrames(4)
+                .activeEnabled(false)
+                .minChallenges(0)
+                .allowedChallengeTypes(Set.of(ChallengeType.BLINK, ChallengeType.SMILE))
+                .activeTimeoutSeconds(6)
+                .maxRetries(3)
+                .failureBehaviour(FailureBehaviour.FALLBACK_SUPERVISOR_OVERRIDE)
+                .padThreshold(0.70)
+                .build();
+    }
+
+    public static LivenessPolicy residentEnrollment() {
+        return defaultResidentEnrollment();
+    }
+
+    public static LivenessPolicy residentAuth() {
+        return defaultResidentAuth();
+    }
+
+    public static LivenessPolicy operatorAuth() {
+        return defaultOperatorAuth();
+    }
+
+    public static LivenessPolicy supervisorAuth() {
+        return defaultSupervisorAuth();
+    }
+
+    /**
      * Default policy for Operator Login Authentication (rapid evaluation, strict lockout).
      */
     public static LivenessPolicy defaultOperatorAuth() {

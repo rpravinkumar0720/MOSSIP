@@ -10,6 +10,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Collections;
 import java.util.HexFormat;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -75,9 +76,9 @@ public record LivenessAuditEvent(
                     + workflow + "|"
                     + eventType + "|"
                     + (decision != null ? decision.name() : "NULL") + "|"
-                    + (passiveScore != null ? String.format("%.4f", passiveScore) : "NULL") + "|"
+                    + (passiveScore != null ? String.format(Locale.ROOT, "%.4f", passiveScore) : "NULL") + "|"
                     + (padClassification != null ? padClassification.name() : "NULL") + "|"
-                    + (padScore != null ? String.format("%.4f", padScore) : "NULL") + "|"
+                    + (padScore != null ? String.format(Locale.ROOT, "%.4f", padScore) : "NULL") + "|"
                     + (challengeType != null ? challengeType.name() : "NULL") + "|"
                     + (errorCode != null ? errorCode : "NULL") + "|"
                     + (modelVersion != null ? modelVersion : "NULL") + "|"
