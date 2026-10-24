@@ -4,21 +4,21 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MOSIP Face Liveness & PAD Verification</title>
-  <meta name="description" content="Production-ready MOSIP biometric face liveness and presentation attack detection (PAD) system">
+  <meta name="description" content="Reference implementation of MOSIP biometric face liveness and presentation attack detection (PAD) system">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div class="app-container">
+  <div class="app-container" id="appContainer">
     <!-- Header -->
     <header class="app-header">
       <div class="brand">
         <div class="brand-badge">MOSIP</div>
         <div class="brand-title">
-          <h1>Face Liveness & PAD</h1>
-          <span class="sub-title">ISO/IEC 19794-5 & ISO 30107 Compliance Engine</span>
+          <h1 id="appTitle">Face Liveness & PAD</h1>
+          <span class="sub-title">ISO/IEC 19794-5 & ISO 30107 Reference Engine</span>
         </div>
       </div>
 
@@ -43,6 +43,9 @@
         </div>
 
         <div class="control-group">
+          <button id="btnVoice" class="btn btn-sm btn-secondary" title="Toggle Spoken Guidance">🔊 Voice: OFF</button>
+          <button id="btnContrast" class="btn btn-sm btn-secondary" title="High Contrast Mode">🌓 Contrast</button>
+          <button id="btnSplitView" class="btn btn-sm btn-secondary hidden" title="Toggle Side-by-Side Split View">🔲 Split View</button>
           <button id="btnJudgeMode" class="btn btn-sm btn-secondary" title="Unlock Judge Mode (token-gated)">⚖️ Judge Mode</button>
         </div>
 
@@ -54,10 +57,13 @@
     </header>
 
     <!-- Main Content Grid -->
-    <main class="main-layout">
+    <main class="main-layout" id="mainLayout">
       <!-- Camera & Verification Stage -->
-      <section class="camera-section">
+      <section class="camera-section" id="cameraSection">
         <div class="camera-viewport-card">
+          <div class="split-view-header hidden" id="splitViewHeaderUser">
+            <span>👤 End-User Experience View (Zero Telemetry Leak)</span>
+          </div>
           <div class="video-wrapper">
             <video id="webcam" autoplay playsinline muted></video>
             <canvas id="overlayCanvas"></canvas>
@@ -71,13 +77,13 @@
             </div>
 
             <!-- On-Screen Prompt Banner -->
-            <div class="prompt-banner" id="promptBanner">
+            <div class="prompt-banner" id="promptBanner" aria-live="polite">
               <div class="prompt-icon" id="promptIcon">👤</div>
               <div class="prompt-text" id="promptText">Position your face in the oval</div>
             </div>
 
             <!-- Challenge Indicator -->
-            <div class="challenge-card hidden" id="challengeCard">
+            <div class="challenge-card hidden" id="challengeCard" aria-live="polite">
               <div class="challenge-icon" id="challengeIcon">👁️</div>
               <div class="challenge-details">
                 <span class="challenge-title" id="challengeTitle">Action Required</span>
@@ -87,6 +93,9 @@
                 <div class="challenge-timer-fill" id="challengeTimerFill"></div>
               </div>
             </div>
+
+            <!-- Color Flash Overlay for Replay Resistance -->
+            <div class="color-flash-overlay hidden" id="colorFlashOverlay"></div>
 
             <!-- Passive Progress Bar -->
             <div class="passive-progress-container" id="passiveProgressContainer">
@@ -98,7 +107,7 @@
 
             <!-- Decision Overlay -->
             <div class="decision-overlay hidden" id="decisionOverlay">
-              <div class="decision-modal" id="decisionModal">
+              <div class="decision-modal" id="decisionModal" aria-live="assertive">
                 <div class="decision-icon" id="decisionIcon">✓</div>
                 <h2 class="decision-title" id="decisionTitle">Verification Successful</h2>
                 <p class="decision-message" id="decisionMessage">Face verification completed.</p>
@@ -149,18 +158,28 @@
               <span class="pill-label">Luma:</span>
               <span class="pill-value" id="valLuma">-</span>
             </div>
+            <div class="metric-pill">
+              <span class="pill-label">Latency:</span>
+              <span class="pill-value" id="valLatency">-- ms</span>
+            </div>
           </div>
         </div>
       </section>
 
-      <!-- Sidebar Tabs: Policy, Audit Trail, Diagnostics -->
-      <aside class="sidebar-section">
+      <!-- Sidebar Tabs: Policy, Audit Trail, Diagnostics, Red Team Lab -->
+      <aside class="sidebar-section" id="sidebarSection">
+        <div class="split-view-header hidden" id="splitViewHeaderJudge">
+          <span>⚖️ Judge & Security Operations Telemetry</span>
+        </div>
+
         <div class="tab-header">
           <button class="tab-btn active" data-tab="tabAudit" id="tabBtnAudit">Audit Chain</button>
           <button class="tab-btn" data-tab="tabPolicy" id="tabBtnPolicy">Policy</button>
-          <button class="tab-btn hidden" data-tab="tabDiag" id="tabBtnDiag">Diagnostics</button>
+          <button class="tab-btn hidden" data-tab="tabDiag" id="tabBtnDiag">Live Telemetry</button>
+          <button class="tab-btn hidden" data-tab="tabRedTeam" id="tabBtnRedTeam">Red Team Lab</button>
         </div>
 
+        <!-- Tab 1: Cryptographic Audit Chain -->
         <div class="tab-content active" id="tabAudit">
           <div class="audit-panel-header">
             <div>
@@ -169,7 +188,7 @@
             </div>
             <div class="audit-actions">
               <button id="btnVerifyChain" class="btn btn-sm btn-verify" title="Verify cryptographic linkage">Verify Chain</button>
-              <button id="btnTamperChain" class="btn btn-sm btn-tamper" title="Simulate adversary modifying audit payload">Tamper Event</button>
+              <button id="btnTamperChain" class="btn btn-sm btn-tamper" title="Simulate local adversary altering an offline audit record">Simulate Edit on Local Log Copy</button>
             </div>
           </div>
 
@@ -182,9 +201,9 @@
             <table class="audit-table">
               <thead>
                 <tr>
-                  <th>Event Type</th>
-                  <th>Decision</th>
-                  <th>Hash Linkage</th>
+                  <th id="thAuditEv">Event Type</th>
+                  <th id="thAuditDec">Decision</th>
+                  <th id="thAuditHash">Hash Linkage</th>
                 </tr>
               </thead>
               <tbody id="auditTableBody">
@@ -194,19 +213,143 @@
           </div>
         </div>
 
+        <!-- Tab 2: Policy Settings -->
         <div class="tab-content" id="tabPolicy">
-          <h3>Effective Policy Settings</h3>
-          <p class="section-desc">Loaded from server policy registry</p>
+          <h3 id="lblPolicyHeader">Effective Policy Settings</h3>
+          <p class="section-desc" id="lblPolicyDesc">Loaded from server policy registry</p>
           <div class="policy-details" id="policyDetailsContainer">
             <div class="policy-loading">Fetching policy parameters...</div>
           </div>
         </div>
 
+        <!-- Tab 3: Live Judge Telemetry (Live Heuristics & Radar) -->
         <div class="tab-content" id="tabDiag">
-          <h3>PAD Diagnostic Channel</h3>
-          <p class="section-desc">Live presentation attack heuristics</p>
-          <div class="diag-container" id="diagContainer">
-            <div class="diag-empty">Diagnostic telemetry will appear when enabled (--diagnostic).</div>
+          <div class="diag-header-bar">
+            <div>
+              <h3>PAD Live Telemetry Radar</h3>
+              <p class="section-desc">Calibrated logistic regression fusion & hard-veto rules</p>
+            </div>
+            <div class="classification-badge-wrap">
+              <span class="classification-badge genuine" id="diagClassification">GENUINE</span>
+            </div>
+          </div>
+
+          <div class="hard-veto-banner hidden" id="diagVetoBanner">
+            <span class="veto-icon">🛡️</span>
+            <span class="veto-text" id="diagVetoText">HARD VETO TRIGGERED: Screen replay detected</span>
+          </div>
+
+          <!-- Overall Scores -->
+          <div class="telemetry-summary-cards">
+            <div class="score-meter-card">
+              <div class="meter-label">
+                <span>Liveness Score</span>
+                <span class="meter-val" id="valLivenessScore">--</span>
+              </div>
+              <div class="meter-track">
+                <div class="meter-fill liveness-fill" id="barLivenessScore" style="width: 0%;"></div>
+              </div>
+            </div>
+            <div class="score-meter-card">
+              <div class="meter-label">
+                <span>Attack Score</span>
+                <span class="meter-val" id="valAttackScore">--</span>
+              </div>
+              <div class="meter-track">
+                <div class="meter-fill attack-fill" id="barAttackScore" style="width: 0%;"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 8 Heuristic Telemetry Meters -->
+          <div class="heuristics-grid">
+            <div class="heuristic-card">
+              <div class="h-label"><span>Micro-Motion Jitter (Tremor)</span><span id="valMicroMotion">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barMicroMotion" style="width: 0%;"></div></div>
+            </div>
+            <div class="heuristic-card">
+              <div class="h-label"><span>Moire Frequency Peak</span><span id="valMoire">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barMoire" style="width: 0%;"></div></div>
+            </div>
+            <div class="heuristic-card">
+              <div class="h-label"><span>Specular Glare Reflection</span><span id="valSpecular">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barSpecular" style="width: 0%;"></div></div>
+            </div>
+            <div class="heuristic-card">
+              <div class="h-label"><span>Texture / Color Saturation</span><span id="valTexture">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barTexture" style="width: 0%;"></div></div>
+            </div>
+            <div class="heuristic-card">
+              <div class="h-label"><span>Margin / Bezel Gradient</span><span id="valBorder">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barBorder" style="width: 0%;"></div></div>
+            </div>
+            <div class="heuristic-card">
+              <div class="h-label"><span>Timing Drift & Jitter</span><span id="valTiming">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barTiming" style="width: 0%;"></div></div>
+            </div>
+            <div class="heuristic-card">
+              <div class="h-label"><span>3D Mask Texture Cue</span><span id="valMask3d">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barMask3d" style="width: 0%;"></div></div>
+            </div>
+            <div class="heuristic-card">
+              <div class="h-label"><span>Landmark-Pixel Consistency</span><span id="valConsistency">--</span></div>
+              <div class="h-track"><div class="h-fill" id="barConsistency" style="width: 0%;"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tab 4: Red Team Lab & Attack Replay Gallery -->
+        <div class="tab-content" id="tabRedTeam">
+          <div class="redteam-header">
+            <h3>Adversarial Attack Simulation Gallery</h3>
+            <p class="section-desc">Replay standardized presentation attacks (PAI-1, PAI-2, PAI-3) and forged landmarks</p>
+          </div>
+
+          <div class="attack-cards-container">
+            <!-- PAI-1 -->
+            <div class="attack-card">
+              <div class="attack-info">
+                <h4>🖨️ PAI-1: Printed Photo Attack</h4>
+                <p>2D matte/gloss paper face, 0D rigid translation, flat border gradients.</p>
+              </div>
+              <button id="btnReplayPrint" class="btn btn-sm btn-replay">▶️ Test Print Attack</button>
+            </div>
+
+            <!-- PAI-2 -->
+            <div class="attack-card">
+              <div class="attack-info">
+                <h4>📱 PAI-2a: Mobile Screen Replay</h4>
+                <p>High-frequency OLED/LCD subpixel grid, specular glare reflection.</p>
+              </div>
+              <button id="btnReplayScreen" class="btn btn-sm btn-replay">▶️ Test Screen Replay</button>
+            </div>
+
+            <!-- PAI-3 -->
+            <div class="attack-card">
+              <div class="attack-info">
+                <h4>🎭 PAI-3: 3D Mask Presentation</h4>
+                <p>Silicone/latex mask with uniform pigment and perimeter boundary discontinuities.</p>
+              </div>
+              <button id="btnReplayMask" class="btn btn-sm btn-replay">▶️ Test 3D Mask</button>
+            </div>
+
+            <!-- Adversarial Landmark Injection -->
+            <div class="attack-card danger-card">
+              <div class="attack-info">
+                <h4>🪪 Adversarial: Forged Landmark Mismatch</h4>
+                <p>Browser landmarks forged with synthetic blinks injected on a static frame.</p>
+              </div>
+              <button id="btnReplayForged" class="btn btn-sm btn-replay btn-danger-action">▶️ Test Forged Landmarks</button>
+            </div>
+          </div>
+
+          <div class="redteam-actions">
+            <button id="btnResetLive" class="btn btn-secondary btn-sm">🔄 Return to Live Camera Stream</button>
+          </div>
+
+          <div class="redteam-terminal" id="redTeamTerminal">
+            <div class="terminal-bar"><span>Red Team Output Log</span></div>
+            <pre class="terminal-body" id="redTeamLog">Ready to execute adversarial attack simulation...</pre>
           </div>
         </div>
       </aside>
@@ -224,7 +367,7 @@
     </footer>
   </div>
 
-  <!-- MediaPipe Tasks Vision CDN -->
+  <!-- MediaPipe Tasks Vision Client -->
   <script type="module" src="app.js"></script>
 </body>
 </html>

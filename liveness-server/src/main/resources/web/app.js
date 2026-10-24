@@ -1,8 +1,10 @@
 // MOSIP Face Liveness & PAD Web Client
-// Modular ES module using MediaPipe Tasks Vision CDN with pinned version
+// Modular ES module using vendored MediaPipe Tasks Vision with graceful CDN fallback
 
+const LOCAL_VISION_URL = '/vendor/mediapipe';
+const LOCAL_MODEL_URL = '/vendor/mediapipe/face_landmarker.task';
 const CDN_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
-const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+const CDN_MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 
 let faceLandmarker = null;
 let video = null;
@@ -12,6 +14,8 @@ let captureCanvas = null;
 let captureCtx = null;
 let websocket = null;
 let isStreaming = false;
+let isReplaying = false;
+let replayInterval = null;
 let currentSessionId = null;
 let currentWorkflow = 'RESIDENT_AUTH';
 let currentLang = 'en';
@@ -24,8 +28,10 @@ let adminToken = sessionStorage.getItem('mosip_admin_token') || (new URLSearchPa
 let activeChallengeToken = null;
 let virtualCameraDetected = false;
 let colorFlashInterval = null;
+let voiceEnabled = false;
+let splitViewActive = false;
 
-// Localization Strings for Web UI
+// Localization Strings for Web UI (English and Tamil)
 const UI_STRINGS = {
   en: {
     title: 'Face Liveness & PAD',
@@ -43,7 +49,13 @@ const UI_STRINGS = {
     cameraRequiredDesc: 'Please allow camera permissions to begin face verification.',
     chainValid: 'Cryptographic Chain Valid (Tamper-Free)',
     chainBroken: 'Tamper Detected! Chain Linkage Broken at Event',
-    noEvents: 'No events recorded yet. Start capture.'
+    noEvents: 'No events recorded yet. Start capture.',
+    progressLabel: 'Passive Liveness',
+    policyHeader: 'Effective Policy Settings',
+    policyDesc: 'Loaded from server policy registry',
+    thEvent: 'Event Type',
+    thDecision: 'Decision',
+    thHash: 'Hash Linkage'
   },
   ta: {
     title: 'முக சரிபார்ப்பு மற்றும் PAD',
@@ -61,7 +73,13 @@ const UI_STRINGS = {
     cameraRequiredDesc: 'முக சரிபார்ப்பைத் தொடங்க கேமரா அனுமதியை வழங்கவும்.',
     chainValid: 'கிரிப்டோகிராஃபிக் தணிக்கை சங்கிலி சரியானது (சேதமடையவில்லை)',
     chainBroken: 'சேதம் கண்டறியப்பட்டது! சங்கிலி இணைப்பு முறிந்தது: நிகழ்வு',
-    noEvents: 'நிகழ்வுகள் எதுவும் இதுவரை பதிவு செய்யப்படவில்லை.'
+    noEvents: 'நிகழ்வுகள் எதுவும் இதுவரை பதிவு செய்யப்படவில்லை.',
+    progressLabel: 'செயலற்ற முக சரிபார்ப்பு',
+    policyHeader: 'செயலில் உள்ள கொள்கை அமைப்புகள்',
+    policyDesc: 'சேவையக கொள்கை பதிவேட்டில் இருந்து ஏற்றப்பட்டது',
+    thEvent: 'நிகழ்வு வகை',
+    thDecision: 'முடிவு',
+    thHash: 'ஹாஷ் இணைப்பு'
   }
 };
 
@@ -73,7 +91,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   checkServerHealth();
   connectWebSocket();
 
-  // Periodic health ping
   setInterval(checkServerHealth, 15000);
 
   try {
@@ -116,7 +133,7 @@ function initEventListeners() {
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
       btn.classList.add('active');
       const targetId = btn.getAttribute('data-tab');
-      document.getElementById(targetId).classList.add('active');
+      document.getElementById(targetId)?.classList.add('active');
     });
   });
 
@@ -134,15 +151,27 @@ function initEventListeners() {
   document.getElementById('btnVerifyChain').addEventListener('click', verifyAuditChain);
   document.getElementById('btnTamperChain').addEventListener('click', tamperAndVerifyAuditChain);
 
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-      isStreaming = false;
-    } else {
-      isStreaming = true;
-      requestAnimationFrame(processVideoFrame);
+  // Accessibility & UX toggles
+  document.getElementById('btnVoice')?.addEventListener('click', () => {
+    voiceEnabled = !voiceEnabled;
+    const btn = document.getElementById('btnVoice');
+    btn.innerText = voiceEnabled ? '🔊 Voice: ON' : '🔊 Voice: OFF';
+    btn.style.borderColor = voiceEnabled ? '#10b981' : '';
+    if (voiceEnabled) {
+      speak(UI_STRINGS[currentLang].positionFace);
     }
   });
 
+  document.getElementById('btnContrast')?.addEventListener('click', () => {
+    document.body.classList.toggle('high-contrast');
+    const isHc = document.body.classList.contains('high-contrast');
+    const btn = document.getElementById('btnContrast');
+    btn.innerText = isHc ? '🌓 Contrast: HIGH' : '🌓 Contrast';
+  });
+
+  document.getElementById('btnSplitView')?.addEventListener('click', toggleSplitView);
+
+  // Judge Mode Unlock
   document.getElementById('btnJudgeMode')?.addEventListener('click', () => {
     if (adminToken) {
       if (confirm('Judge Mode is currently active. Would you like to exit Judge Mode?')) {
@@ -163,22 +192,71 @@ function initEventListeners() {
       }
     }
   });
+
+  // Red Team Attack Gallery Events
+  document.getElementById('btnReplayPrint')?.addEventListener('click', () => triggerAttackSimulation('PRINT_ATTACK'));
+  document.getElementById('btnReplayScreen')?.addEventListener('click', () => triggerAttackSimulation('SCREEN_REPLAY'));
+  document.getElementById('btnReplayMask')?.addEventListener('click', () => triggerAttackSimulation('MASK_3D'));
+  document.getElementById('btnReplayForged')?.addEventListener('click', () => triggerAttackSimulation('FORGED_LANDMARKS'));
+  document.getElementById('btnResetLive')?.addEventListener('click', resetToLiveCamera);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      isStreaming = false;
+    } else {
+      isStreaming = true;
+      requestAnimationFrame(processVideoFrame);
+    }
+  });
+}
+
+function toggleSplitView() {
+  splitViewActive = !splitViewActive;
+  const layout = document.getElementById('mainLayout');
+  const userHeader = document.getElementById('splitViewHeaderUser');
+  const judgeHeader = document.getElementById('splitViewHeaderJudge');
+  const btn = document.getElementById('btnSplitView');
+
+  if (splitViewActive) {
+    layout.classList.add('split-view-active');
+    userHeader?.classList.remove('hidden');
+    judgeHeader?.classList.remove('hidden');
+    btn.innerText = '🔲 Split: ON';
+    btn.style.borderColor = '#3b82f6';
+    document.getElementById('tabBtnDiag')?.click();
+  } else {
+    layout.classList.remove('split-view-active');
+    userHeader?.classList.add('hidden');
+    judgeHeader?.classList.add('hidden');
+    btn.innerText = '🔲 Split View';
+    btn.style.borderColor = '';
+  }
 }
 
 function updateJudgeModeUI() {
   const btn = document.getElementById('btnJudgeMode');
+  const btnSplit = document.getElementById('btnSplitView');
   const tabDiag = document.getElementById('tabBtnDiag');
+  const tabRedTeam = document.getElementById('tabBtnRedTeam');
+
   if (btn) {
     if (adminToken) {
       btn.innerText = '⚖️ Judge: ON';
       btn.style.background = 'rgba(16, 185, 129, 0.2)';
       btn.style.borderColor = '#10b981';
+      btnSplit?.classList.remove('hidden');
       tabDiag?.classList.remove('hidden');
+      tabRedTeam?.classList.remove('hidden');
     } else {
       btn.innerText = '⚖️ Judge Mode';
       btn.style.background = '';
       btn.style.borderColor = '';
+      btnSplit?.classList.add('hidden');
       tabDiag?.classList.add('hidden');
+      tabRedTeam?.classList.add('hidden');
+      if (splitViewActive) {
+        toggleSplitView();
+      }
     }
   }
 }
@@ -192,33 +270,78 @@ function updateLanguage() {
   document.getElementById('challengeTitle').innerText = strings.actionRequired;
   document.getElementById('btnRetry').innerText = strings.startNewSession;
   document.getElementById('btnViewAuditFromModal').innerText = strings.inspectAudit;
+
+  // Localize table headers and policy labels
+  const thEv = document.getElementById('thAuditEv');
+  const thDec = document.getElementById('thAuditDec');
+  const thHash = document.getElementById('thAuditHash');
+  if (thEv) thEv.innerText = strings.thEvent;
+  if (thDec) thDec.innerText = strings.thDecision;
+  if (thHash) thHash.innerText = strings.thHash;
+
+  const lblPolH = document.getElementById('lblPolicyHeader');
+  const lblPolD = document.getElementById('lblPolicyDesc');
+  if (lblPolH) lblPolH.innerText = strings.policyHeader;
+  if (lblPolD) lblPolD.innerText = strings.policyDesc;
 }
 
-// MediaPipe Initialization with graceful CDN fallback
-async function initMediaPipe() {
+function speak(text) {
+  if (!voiceEnabled || !('speechSynthesis' in window) || !text) return;
   try {
-    const vision = await import(/* webpackIgnore: true */ `${CDN_VISION_URL}/vision_bundle.mjs`);
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = currentLang === 'ta' ? 'ta-IN' : 'en-US';
+    utter.rate = 0.95;
+    window.speechSynthesis.speak(utter);
+  } catch (e) {
+    // audio fallback
+  }
+}
+
+// MediaPipe Initialization: Offline Vendored Asset First with CDN Fallback
+async function initMediaPipe() {
+  // 1. Try local offline vendored assets first
+  try {
+    const vision = await import(/* webpackIgnore: true */ `${LOCAL_VISION_URL}/vision_bundle.mjs`);
     const FilesetResolver = vision.FilesetResolver;
     const FaceLandmarker = vision.FaceLandmarker;
 
-    const fileset = await FilesetResolver.forVisionTasks(
-      `${CDN_VISION_URL}/wasm`
-    );
-
+    const fileset = await FilesetResolver.forVisionTasks(`${LOCAL_VISION_URL}/wasm`);
     faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
       baseOptions: {
-        modelAssetPath: MODEL_URL,
+        modelAssetPath: LOCAL_MODEL_URL,
         delegate: 'GPU'
       },
       outputFaceBlendshapes: false,
       runningMode: 'VIDEO',
       numFaces: 1
     });
-    console.log('MediaPipe FaceLandmarker successfully initialized');
-  } catch (err) {
-    console.error('Failed to load MediaPipe Tasks Vision from CDN:', err);
-    // Fallback notice
-    document.getElementById('promptText').innerText = 'MediaPipe CDN unreachable; server fallback active';
+    console.log('MediaPipe FaceLandmarker successfully initialized from offline vendored assets.');
+    return;
+  } catch (localErr) {
+    console.warn('Local MediaPipe asset loading skipped/failed, trying CDN fallback:', localErr);
+  }
+
+  // 2. Fallback to CDN
+  try {
+    const vision = await import(/* webpackIgnore: true */ `${CDN_VISION_URL}/vision_bundle.mjs`);
+    const FilesetResolver = vision.FilesetResolver;
+    const FaceLandmarker = vision.FaceLandmarker;
+
+    const fileset = await FilesetResolver.forVisionTasks(`${CDN_VISION_URL}/wasm`);
+    faceLandmarker = await FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: CDN_MODEL_URL,
+        delegate: 'GPU'
+      },
+      outputFaceBlendshapes: false,
+      runningMode: 'VIDEO',
+      numFaces: 1
+    });
+    console.log('MediaPipe FaceLandmarker initialized from CDN.');
+  } catch (cdnErr) {
+    console.warn('MediaPipe CDN load failed. Server-side face detector will corroborate frames directly.');
+    document.getElementById('promptText').innerText = 'Server face detection active';
   }
 }
 
@@ -322,7 +445,7 @@ async function connectWebSocket() {
 
   websocket.onclose = () => {
     updateStatus(false, 'Disconnected');
-    if (reconnectAttempts < 1) {
+    if (reconnectAttempts < 1 && !isReplaying) {
       reconnectAttempts++;
       setTimeout(connectWebSocket, 1500);
     }
@@ -343,11 +466,10 @@ function updateStatus(connected, label) {
 
 // Main Frame Processing Loop
 async function processVideoFrame(timestamp) {
-  if (!isStreaming || !video || video.paused || video.ended) {
+  if (!isStreaming || isReplaying || !video || video.paused || video.ended) {
     return;
   }
 
-  // Throttle sending to ~12 FPS (every 80 ms)
   const shouldSend = (timestamp - lastCaptureTime) >= 80;
 
   let normalizedLandmarks = [];
@@ -358,15 +480,15 @@ async function processVideoFrame(timestamp) {
 
       if (results && results.faceLandmarks && results.faceLandmarks.length > 0) {
         const rawPoints = results.faceLandmarks[0];
+        // Send 2D landmarks rounded to 4 decimal places for optimal network bandwidth
         normalizedLandmarks = rawPoints.map(p => [
           Math.round(p.x * 10000) / 10000,
-          Math.round(p.y * 10000) / 10000,
-          Math.round((p.z || 0) * 10000) / 10000
+          Math.round(p.y * 10000) / 10000
         ]);
         drawFaceMeshPreview(overlayCtx, rawPoints, overlayCanvas.width, overlayCanvas.height);
       }
     } catch (e) {
-      // Ignore dropped detection frame
+      // dropped detection frame
     }
   }
 
@@ -384,7 +506,6 @@ function drawFaceMeshPreview(ctx, points, width, height) {
   ctx.translate(-width, 0);
 
   ctx.fillStyle = 'rgba(59, 130, 246, 0.6)';
-  // Draw select representative facial contour points
   const keyIndices = [4, 152, 33, 133, 362, 263, 61, 291];
   for (const idx of keyIndices) {
     if (points[idx]) {
@@ -404,7 +525,6 @@ function captureAndSendFrame(landmarks) {
   captureCanvas.width = targetW;
   captureCanvas.height = targetH;
 
-  // IMPORTANT: Un-mirrored raw pixels sent to server decisions
   captureCtx.drawImage(video, 0, 0, targetW, targetH);
   const jpegB64 = captureCanvas.toDataURL('image/jpeg', 0.85);
 
@@ -434,6 +554,7 @@ function handleServerMessage(msg) {
   switch (msg.type) {
     case 'state':
       document.getElementById('promptText').innerText = msg.prompt || '';
+      speak(msg.prompt);
       if (msg.state === 'ACTIVE_CHALLENGE') {
         document.getElementById('challengeCard').classList.remove('hidden');
       } else {
@@ -462,12 +583,13 @@ function handleServerMessage(msg) {
       const lbl = document.getElementById('passiveProgressLabel');
       const pct = Math.round((msg.collected / msg.window) * 100);
       fill.style.width = `${pct}%`;
-      lbl.innerText = `Passive Liveness ${msg.collected}/${msg.window}`;
+      lbl.innerText = `${(UI_STRINGS[currentLang] || UI_STRINGS.en).progressLabel} ${msg.collected}/${msg.window}`;
       break;
 
     case 'challenge':
       activeChallengeToken = msg.challengeToken || msg.challengeId || null;
       showChallenge(msg.challengeType, msg.prompt, msg.timeoutMs || 4000);
+      speak(msg.prompt);
       break;
 
     case 'decision':
@@ -588,6 +710,8 @@ function handleDecision(decision) {
     : (UI_STRINGS[currentLang] || UI_STRINGS.en).verifFailed;
 
   message.innerText = decision.userMessage;
+  speak(decision.userMessage);
+
   if (decision.score !== undefined && decision.score !== null) {
     score.innerText = decision.score.toFixed(2);
     document.getElementById('decisionScoreRow')?.classList.remove('hidden');
@@ -604,18 +728,22 @@ function handleDecision(decision) {
 
   overlay.classList.remove('hidden');
 
-  // Automatically refresh audit trail for this session
   if (currentSessionId && adminToken) {
     fetchAuditTrail(currentSessionId);
   }
 }
 
 function resetAndReconnect() {
+  if (replayInterval) {
+    clearInterval(replayInterval);
+    replayInterval = null;
+  }
+  isReplaying = false;
   document.getElementById('decisionOverlay').classList.add('hidden');
   document.getElementById('challengeCard').classList.add('hidden');
   document.getElementById('ovalGuide').className = 'oval-guide';
   document.getElementById('passiveProgressFill').style.width = '0%';
-  document.getElementById('passiveProgressLabel').innerText = 'Passive Liveness 0/5';
+  document.getElementById('passiveProgressLabel').innerText = `${(UI_STRINGS[currentLang] || UI_STRINGS.en).progressLabel} 0/5`;
   frameSequence = 0;
   connectWebSocket();
 }
@@ -652,79 +780,23 @@ function renderAuditTable(events) {
   }
 
   events.forEach(ev => {
-    const row = document.createElement('tr');
-    const prevShort = ev.previousHash ? ev.previousHash.substring(0, 7) + '...' : 'GENESIS';
-    const currShort = ev.currentHash ? ev.currentHash.substring(0, 7) + '...' : '-';
+    const tr = document.createElement('tr');
+    const decisionClass = ev.decision === 'ACCEPTED' ? 'badge-accepted' :
+                          (ev.decision === 'REJECTED' ? 'badge-rejected' : 'badge-neutral');
 
-    row.innerHTML = `
-      <td><strong>${ev.eventType}</strong></td>
-      <td>${ev.decision || '-'}</td>
-      <td>
-        <span class="hash-link" title="${ev.previousHash} -> ${ev.currentHash}">
-          ${prevShort} <span class="hash-arrow">➔</span> ${currShort}
-        </span>
-      </td>
+    tr.innerHTML = `
+      <td class="event-name">${ev.eventType}</td>
+      <td><span class="decision-pill ${decisionClass}">${ev.decision || 'IN_PROGRESS'}</span></td>
+      <td class="code-font" title="Prev: ${ev.previousHash}&#10;Curr: ${ev.currentHash}">${(ev.currentHash || '').substring(0, 10)}...</td>
     `;
-    tbody.appendChild(row);
+    tbody.appendChild(tr);
   });
 }
 
 async function verifyAuditChain() {
-  const badge = document.getElementById('chainVerificationBadge');
-  const text = document.getElementById('chainVerificationText');
-  const headers = {};
-  if (adminToken) {
-    headers['Authorization'] = `Bearer ${adminToken}`;
-  }
-
-  // If localAuditEvents is empty, attempt to fetch from session or system audit trail
   if (!localAuditEvents || localAuditEvents.length === 0) {
-    if (currentSessionId) {
-      await fetchAuditTrail(currentSessionId);
-    }
-    if (!localAuditEvents || localAuditEvents.length === 0) {
-      try {
-        const resAll = await fetch('/api/audit', { headers });
-        if (resAll.ok) {
-          const events = await resAll.json();
-          if (events && events.length > 0) {
-            localAuditEvents = events;
-            renderAuditTable(events);
-          }
-        }
-      } catch (e) {
-        // Fallback to server verify endpoint
-      }
-    }
-  }
-
-  // If still no events recorded, query global audit verification
-  if (!localAuditEvents || localAuditEvents.length === 0) {
-    try {
-      const res = await fetch('/api/audit/verify', { headers });
-      if (res.status === 401) {
-        badge.classList.remove('hidden');
-        badge.className = 'verification-badge invalid';
-        badge.querySelector('.badge-icon').innerText = '🔒';
-        text.innerText = 'Audit verification requires Admin/Judge Token (click Judge Mode).';
-        return;
-      }
-      const result = await res.json();
-      badge.classList.remove('hidden');
-      if (result.valid) {
-        badge.className = 'verification-badge valid';
-        badge.querySelector('.badge-icon').innerText = '✓';
-        text.innerText = `${UI_STRINGS[currentLang].chainValid} (${result.count} server events verified)`;
-      } else {
-        badge.className = 'verification-badge invalid';
-        badge.querySelector('.badge-icon').innerText = '⚠️';
-        text.innerText = `${UI_STRINGS[currentLang].chainBroken} #${result.firstBrokenIndex}: ${result.message}`;
-      }
-      return;
-    } catch (err) {
-      alert('Failed to verify chain: ' + err.message);
-      return;
-    }
+    alert('No events to verify. Run a liveness verification capture first.');
+    return;
   }
 
   try {
@@ -738,64 +810,38 @@ async function verifyAuditChain() {
       body: JSON.stringify(localAuditEvents)
     });
     if (res.status === 401) {
-      badge.classList.remove('hidden');
-      badge.className = 'verification-badge invalid';
-      badge.querySelector('.badge-icon').innerText = '🔒';
-      text.innerText = 'Audit verification requires Admin/Judge Token (click Judge Mode).';
+      alert('Audit verification requires Admin/Judge Token (click Judge Mode).');
       return;
     }
     const result = await res.json();
 
+    const badge = document.getElementById('chainVerificationBadge');
+    const text = document.getElementById('chainVerificationText');
     badge.classList.remove('hidden');
+
     if (result.valid) {
       badge.className = 'verification-badge valid';
       badge.querySelector('.badge-icon').innerText = '✓';
-      text.innerText = `${UI_STRINGS[currentLang].chainValid} (${localAuditEvents.length} events verified)`;
+      text.innerText = UI_STRINGS[currentLang].chainValid;
     } else {
       badge.className = 'verification-badge invalid';
-      badge.querySelector('.badge-icon').innerText = '⚠️';
-      text.innerText = `${UI_STRINGS[currentLang].chainBroken} #${result.firstBrokenIndex}: ${result.message}`;
+      badge.querySelector('.badge-icon').innerText = '✕';
+      text.innerText = `${UI_STRINGS[currentLang].chainBroken} #${result.firstBrokenIndex} (${result.message})`;
     }
   } catch (err) {
-    alert('Failed to verify chain: ' + err.message);
+    alert('Verification request failed: ' + err.message);
   }
 }
 
 async function tamperAndVerifyAuditChain() {
-  const headers = {};
-  if (adminToken) {
-    headers['Authorization'] = `Bearer ${adminToken}`;
-  }
   if (!localAuditEvents || localAuditEvents.length === 0) {
-    if (currentSessionId) {
-      await fetchAuditTrail(currentSessionId);
-    }
-    if (!localAuditEvents || localAuditEvents.length === 0) {
-      try {
-        const resAll = await fetch('/api/audit', { headers });
-        if (resAll.ok) {
-          const events = await resAll.json();
-          if (events && events.length > 0) {
-            localAuditEvents = events;
-            renderAuditTable(events);
-          }
-        }
-      } catch (e) {}
-    }
-  }
-
-  if (!localAuditEvents || localAuditEvents.length === 0) {
-    alert('No audit events available to tamper. Please complete a session first or enable Judge Mode.');
+    alert('No events recorded yet. Complete a verification first to generate audit records.');
     return;
   }
 
-  // Clone and tamper with target event: toggle decision to guarantee a broken hash
   const tamperedChain = JSON.parse(JSON.stringify(localAuditEvents));
-  const targetIdx = Math.max(0, tamperedChain.length - 1);
-  const oldDec = tamperedChain[targetIdx].decision;
-  tamperedChain[targetIdx].decision = (oldDec === 'ACCEPTED' ? 'REJECTED' : 'ACCEPTED');
-
-  renderAuditTable(tamperedChain);
+  const target = tamperedChain[tamperedChain.length - 1];
+  target.decision = target.decision === 'ACCEPTED' ? 'REJECTED' : 'ACCEPTED';
 
   try {
     const postHeaders = { 'Content-Type': 'application/json' };
@@ -824,7 +870,7 @@ async function tamperAndVerifyAuditChain() {
   }
 }
 
-// Policy & Diagnostics API
+// Policy & Health API
 async function loadPolicyDetails(workflow) {
   const container = document.getElementById('policyDetailsContainer');
   try {
@@ -844,7 +890,7 @@ async function loadPolicyDetails(workflow) {
 
     container.innerHTML = `
       <div class="policy-desc" style="margin-bottom:12px;font-size:0.85rem;color:var(--text-muted);">${p.description || ''}</div>
-      <div class="policy-item"><span class="policy-key">Workflow</span><span class="policy-val" style="color:var(--accent-teal);font-weight:600;">${p.workflow}</span></div>
+      <div class="policy-item"><span class="policy-key">Workflow</span><span class="policy-val" style="color:#60a5fa;font-weight:600;">${p.workflow}</span></div>
       <div class="policy-item"><span class="policy-key">Passive Threshold</span><span class="policy-val">${p.passiveThreshold}</span></div>
       <div class="policy-item"><span class="policy-key">PAD Attack Threshold</span><span class="policy-val">${p.padThreshold}</span></div>
       <div class="policy-item"><span class="policy-key">Active Challenges</span><span class="policy-val">${p.activeEnabled ? 'Enabled (' + p.minChallenges + ' required)' : 'Disabled (Passive-first)'}</span></div>
@@ -870,7 +916,7 @@ async function checkServerHealth() {
         indicator.title = `Status: ${data.status} | Mode: ${data.mode} | Version: ${data.engineVersion} | Uptime: ${data.uptimeSeconds}s | Audit Events: ${data.totalAuditEvents} | Integrity: ${data.auditChainIntegrity ? 'Tamper-Free' : 'Broken'}`;
       }
       if (data.mode === 'diagnostic') {
-        document.getElementById('tabBtnDiag').classList.remove('hidden');
+        document.getElementById('tabBtnDiag')?.classList.remove('hidden');
       }
     } else {
       updateStatus(false, 'Server Error ' + res.status);
@@ -880,16 +926,181 @@ async function checkServerHealth() {
   }
 }
 
+// Live Telemetry & Radar Rendering
 function renderDiagnosticTelemetry(diag) {
-  const container = document.getElementById('diagContainer');
-  if (!diag.weights) return;
-
-  let html = `<div class="policy-item"><span class="policy-key">Model Version</span><span class="policy-val">${diag.engineVersion}</span></div>`;
-  html += `<h4>Passive Weights</h4>`;
-  for (const [k, v] of Object.entries(diag.weights)) {
-    html += `<div class="policy-item"><span class="policy-key">${k}</span><span class="policy-val">${(v * 100).toFixed(0)}%</span></div>`;
+  if (diag.latencyMs !== undefined) {
+    const latEl = document.getElementById('valLatency');
+    if (latEl) latEl.innerText = `${diag.latencyMs} ms`;
   }
-  container.innerHTML = html;
+
+  if (diag.livenessScore !== undefined) {
+    const lScore = Number(diag.livenessScore) || 0.0;
+    const aScore = Number(diag.attackScore) || 0.0;
+
+    const valL = document.getElementById('valLivenessScore');
+    const barL = document.getElementById('barLivenessScore');
+    const valA = document.getElementById('valAttackScore');
+    const barA = document.getElementById('barAttackScore');
+
+    if (valL) valL.innerText = lScore.toFixed(3);
+    if (barL) barL.style.width = `${Math.round(lScore * 100)}%`;
+    if (valA) valA.innerText = aScore.toFixed(3);
+    if (barA) barA.style.width = `${Math.round(aScore * 100)}%`;
+
+    const classBadge = document.getElementById('diagClassification');
+    if (classBadge && diag.classification) {
+      classBadge.innerText = diag.classification;
+      if (diag.isAttack) {
+        classBadge.className = 'classification-badge attack';
+      } else {
+        classBadge.className = 'classification-badge genuine';
+      }
+    }
+
+    const vetoBanner = document.getElementById('diagVetoBanner');
+    const vetoText = document.getElementById('diagVetoText');
+    if (vetoBanner && vetoText) {
+      if (diag.isAttack && aScore >= 0.70) {
+        vetoBanner.classList.remove('hidden');
+        vetoText.innerText = `PAD ALERT: Presentation Attack Detected (${diag.classification || 'ATTACK'})`;
+      } else {
+        vetoBanner.classList.add('hidden');
+      }
+    }
+  }
+
+  if (diag.heuristics && typeof diag.heuristics === 'object') {
+    updateHeuristicMeter('MicroMotion', diag.heuristics.microMotion);
+    updateHeuristicMeter('Moire', diag.heuristics.moire);
+    updateHeuristicMeter('Specular', diag.heuristics.specular);
+    updateHeuristicMeter('Texture', diag.heuristics.texture);
+    updateHeuristicMeter('Border', diag.heuristics.border);
+    updateHeuristicMeter('Timing', diag.heuristics.timing);
+    updateHeuristicMeter('Mask3d', diag.heuristics.mask3d);
+    updateHeuristicMeter('Consistency', diag.heuristics.consistency);
+  }
+}
+
+function updateHeuristicMeter(idSuffix, score) {
+  if (score === undefined || score === null) return;
+  const val = Number(score) || 0;
+  const bar = document.getElementById('bar' + idSuffix);
+  const lbl = document.getElementById('val' + idSuffix);
+  if (bar) {
+    bar.style.width = `${Math.min(100, Math.max(0, Math.round(val * 100)))}%`;
+    bar.style.backgroundColor = val >= 0.70 ? '#10b981' : (val >= 0.35 ? '#f59e0b' : '#ef4444');
+  }
+  if (lbl) {
+    lbl.innerText = val.toFixed(2);
+  }
+}
+
+// Red Team Adversarial Attack Simulation Gallery
+function triggerAttackSimulation(attackType) {
+  const logEl = document.getElementById('redTeamLog');
+  isReplaying = true;
+  if (replayInterval) clearInterval(replayInterval);
+
+  logEl.innerText = `[${new Date().toLocaleTimeString()}] INITIATING ATTACK SIMULATION: ${attackType}...\n`;
+  document.getElementById('tabBtnDiag')?.click();
+
+  // Create synthetic frame generator matching attack characteristics
+  const canvas = document.createElement('canvas');
+  canvas.width = 640;
+  canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+
+  let frameCount = 0;
+  replayInterval = setInterval(() => {
+    frameCount++;
+
+    // Base background and face oval
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(0, 0, 640, 480);
+
+    ctx.fillStyle = '#d4a373'; // Synthetic skin tone
+    ctx.beginPath();
+    ctx.ellipse(320, 240, 110, 150, 0, 0, 2 * Math.PI);
+    ctx.fill();
+
+    let landmarks = [];
+
+    if (attackType === 'PRINT_ATTACK') {
+      // PAI-1: Flat printed paper border with 0 micro-motion
+      ctx.strokeStyle = '#f8fafc';
+      ctx.lineWidth = 14;
+      ctx.strokeRect(180, 70, 280, 340);
+      landmarks = generateStaticMeshPoints(320, 240, 0, 0);
+      logEl.innerText += `Frame ${frameCount}: Injected 2D flat paper boundary, jitter residual = 0.000\n`;
+
+    } else if (attackType === 'SCREEN_REPLAY') {
+      // PAI-2: High-frequency subpixel grid pattern & specular highlight
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+      ctx.fillRect(280, 180, 50, 35); // Glare patch
+      landmarks = generateStaticMeshPoints(320, 240, 0.0001, 0.0001);
+      logEl.innerText += `Frame ${frameCount}: Injected OLED subpixel frequency peak & specular reflection\n`;
+
+    } else if (attackType === 'MASK_3D') {
+      // PAI-3: Silicone mask perimeter contour discontinuity
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+      ctx.lineWidth = 6;
+      ctx.stroke();
+      landmarks = generateStaticMeshPoints(320, 240, 0.0002, 0.0002);
+      logEl.innerText += `Frame ${frameCount}: Injected mask cutout edge gradient & uniform reflectance\n`;
+
+    } else if (attackType === 'FORGED_LANDMARKS') {
+      // Adversarial: Static frame with injected eye blink & head turn landmarks
+      const ear = frameCount % 2 === 0 ? 0.05 : 0.32; // Alternating blink
+      const yawDelta = (frameCount * 5);
+      landmarks = generateStaticMeshPoints(320 + yawDelta, 240, 0, 0, ear);
+      logEl.innerText += `Frame ${frameCount}: INJECTING FORGED LANDMARKS (EAR=${ear}, Yaw=${yawDelta}°) on static frame\n`;
+    }
+
+    const jpegB64 = canvas.toDataURL('image/jpeg', 0.85);
+    if (websocket && websocket.readyState === WebSocket.OPEN) {
+      websocket.send(JSON.stringify({
+        type: 'frame',
+        seq: frameSequence++,
+        tsMs: Date.now(),
+        jpegB64: jpegB64,
+        landmarks: landmarks,
+        width: 640,
+        height: 480
+      }));
+    }
+
+    if (frameCount >= 6) {
+      clearInterval(replayInterval);
+      replayInterval = null;
+      logEl.innerText += `\n[${new Date().toLocaleTimeString()}] ATTACK COMPLETE. Inspecting server defense reaction...\n`;
+    }
+  }, 100);
+}
+
+function generateStaticMeshPoints(cx, cy, jx, jy, customEar) {
+  const points = [];
+  for (let i = 0; i < 478; i++) {
+    const nx = (cx / 640) + ((i % 20) - 10) * 0.01 + jx;
+    const ny = (cy / 480) + (Math.floor(i / 20) - 12) * 0.01 + jy;
+    points.push([
+      Math.round(nx * 10000) / 10000,
+      Math.round(ny * 10000) / 10000
+    ]);
+  }
+  return points;
+}
+
+function resetToLiveCamera() {
+  if (replayInterval) {
+    clearInterval(replayInterval);
+    replayInterval = null;
+  }
+  isReplaying = false;
+  const logEl = document.getElementById('redTeamLog');
+  if (logEl) {
+    logEl.innerText = `[${new Date().toLocaleTimeString()}] Restored live webcam input stream.`;
+  }
+  resetAndReconnect();
 }
 
 function showCameraError(title, msg) {

@@ -59,9 +59,28 @@ public interface LivenessEngine extends AutoCloseable {
     String getEngineVersion();
 
     /**
+     * Finishes an active or decided session, cleaning up resources and wiping retained frames.
+     *
+     * @param session session to finish
+     */
+    default void finishSession(LivenessSession session) {
+        cancelSession(session);
+    }
+
+    /**
      * Checks if underlying ONNX runtime and models are loaded and ready for inference.
      */
     boolean isReady();
+
+    /**
+     * Returns real-time diagnostic metrics and heuristic scores for the given session.
+     *
+     * @param session active or decided session
+     * @return map of diagnostic metrics
+     */
+    default java.util.Map<String, Object> getSessionDiagnostics(LivenessSession session) {
+        return java.util.Map.of();
+    }
 
     @Override
     default void close() {

@@ -37,6 +37,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -681,6 +682,38 @@ public class DefaultLivenessEngine implements LivenessEngine {
 
         ctx.auditTailHash = event.currentHash();
         auditSink.append(event);
+    }
+
+    @Override
+    public void finishSession(LivenessSession session) {
+        if (session != null) {
+            session.close();
+            SessionContext ctx = sessions.remove(session.getSessionId());
+            if (ctx != null) {
+                if (ctx.bestCompliantFrame != null && !ctx.bestCompliantFrame.isWiped()) {
+                    ctx.bestCompliantFrame.wipe();
+                }
+            }
+        }
+    }
+
+    @Override
+    public Map<String, Object> getSessionDiagnostics(LivenessSession session) {
+        if (session == null) return Map.of();
+        SessionContext ctx = sessions.get(session.getSessionId());
+        if (ctx == null) return Map.of();
+        Map<String, Object> diag = new LinkedHashMap<>();
+        diag.put("state", ctx.state != null ? ctx.state.name() : "UNKNOWN");
+        diag.put("windowSize", ctx.frameWindow != null ? ctx.frameWindow.size() : 0);
+        diag.put("consecutiveCompliantFrames", ctx.consecutiveCompliantFrames);
+        if (ctx.latestPassiveResult != null) {
+            diag.put("livenessScore", ctx.latestPassiveResult.livenessScore());
+            diag.put("attackScore", ctx.latestPassiveResult.padResult().attackScore());
+            diag.put("classification", ctx.latestPassiveResult.padResult().classification().name());
+            diag.put("isAttack", ctx.latestPassiveResult.padResult().isAttack());
+            diag.put("heuristics", ctx.latestPassiveResult.padResult().heuristics());
+        }
+        return diag;
     }
 
     @Override

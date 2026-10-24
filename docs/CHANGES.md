@@ -155,3 +155,72 @@ This document maps all identified architectural, security, algorithmic, and pres
   - Dropped unused `liveness-device-mock` dependency from `liveness-server/pom.xml`.
 - **Commit:** `feat(eval): benchmark ISO/IEC 30107-3 metrics, adversarial tests, and jacoco gate`
 - **Tests:** `mvn verify` across all modules
+
+---
+
+## Phase P3: Demo & Packaging, Hardening, and Docs Honesty
+
+### [P3-1] Judge Mode UI, Split View & Red Team Replay Gallery
+- **Finding:** Diagnostic WS messages only sent static weights without live signal scores. Judges had no way to view internal engine state side-by-side with user view or test specific attacks interactively.
+- **Resolution:**
+  - Implemented `LivenessEngine.getSessionDiagnostics(session)` in `DefaultLivenessEngine.java` exposing real-time per-signal heuristic scores (`microMotion`, `moire`, `specular`, `texture`, `border`, `timing`, `consistency`, `mask3d`), liveness score, attack score, and attack classification.
+  - Updated `WebSocketHandler.java` to measure frame processing latency in nanoseconds and stream live telemetry whenever Judge Mode or `--diagnostic` is active.
+  - Implemented side-by-side "Split View" mode in `index.html` and `app.js` separating "What the Attacker Sees" (clean video, generic status, zero leakage) from "What the Audit Knows" (real-time telemetry radar, latency badge, veto status).
+  - Built an interactive **Red Team Lab** with four standardized attack simulators (Print Attack, Mobile Screen Replay, 3D Mask, and Forged Landmark Injection) demonstrating real-time blocking and evidence generation.
+- **Commit:** `feat(p3): judge mode split view, audit verifier cli, offline mediapipe, mosip receipt, docs honesty`
+- **Tests:** `WebSocketHandlerTest`, `DefaultLivenessEngineTest`
+
+### [P3-2] Honest Tamper Demo & Standalone AuditVerifierCli
+- **Finding:** Tamper button misleadingly appeared to edit server state in place rather than demonstrating audit verification failure on an altered copy. No offline verification tool existed for auditors.
+- **Resolution:**
+  - Relabeled browser button to *"Simulate Edit on Local Log Copy"* with clear explanatory tooltips.
+  - Implemented standalone command-line tool `io.mosip.liveness.core.audit.AuditVerifierCli.java` in `liveness-core` (pure Java 17, zero external runtime dependencies) that parses `audit.jsonl` files, verifies SHA-256 hash chaining, checks genesis root, verifies canonical details, and validates terminal HMAC-SHA256 signatures.
+- **Commit:** `feat(p3): judge mode split view, audit verifier cli, offline mediapipe, mosip receipt, docs honesty`
+- **Tests:** `AuditVerifierCliTest`
+
+### [P3-3] Offline MediaPipe Vendoring & HTTPS / TLS Architecture
+- **Finding:** Browser client loaded MediaPipe WebAssembly and task models dynamically from jsDelivr and Google Cloud Storage at runtime, breaking offline operation and data-sovereignty mandates. Mobile browsers failed `getUserMedia` over local Wi-Fi without HTTPS.
+- **Resolution:**
+  - Downloaded and vendored MediaPipe Tasks Vision bundle, WebAssembly runtimes (`vision_wasm_internal.*`, `vision_wasm_nosimd_internal.*`), and `face_landmarker.task` directly into `liveness-server/src/main/resources/web/vendor/mediapipe/`.
+  - Updated `app.js` to load from local offline vendored assets first, gracefully falling back to CDN only if local files are missing.
+  - Added `scripts/download_mediapipe.sh` and `scripts/download_mediapipe.ps1` for reproducible asset downloads.
+  - Added `Caddyfile` and `docker-compose.yml` configuring automatic internal TLS on port 8443 reverse-proxying to `liveness-server:8080`, enabling mobile webcam testing across local LANs.
+- **Commit:** `feat(p3): judge mode split view, audit verifier cli, offline mediapipe, mosip receipt, docs honesty`
+- **Tests:** Verified offline loading in web client
+
+### [P3-4] MOSIP Integration Story & Signed JWS Liveness Receipts
+- **Finding:** The accepted "best compliant frame" never left the engine, and no integration receipt or MOSIP biometric SDK adapter existed showing how Registration Client or IDA would consume results.
+- **Resolution:**
+  - Implemented `MosipLivenessReceipt.java` generating RFC 7515 compliant JWS compact tokens signed with HMAC-SHA256, cryptographically binding `sessionId`, `nonce`, `decision` (`ACCEPTED`), `workflow`, `policyHash`, `bestFrameSha256`, and expiration.
+  - Implemented `MosipBiometricSdkAdapter.java` demonstrating how MOSIP Registration Client / IDA validates presented liveness assertion receipts against expected nonces and workflows before accepting biometric packets.
+- **Commit:** `feat(p3): judge mode split view, audit verifier cli, offline mediapipe, mosip receipt, docs honesty`
+- **Tests:** `MosipLivenessReceiptTest`, `MosipBiometricSdkAdapterTest`
+
+### [P3-5] Accessibility, Tamil i18n & SpeechSynthesis Voice Guidance
+- **Finding:** Progress bar labels, policy drawers, and audit headers were only partially translated into Tamil. No spoken audio guidance existed for low-vision users.
+- **Resolution:**
+  - Extended `LocalizationService.java` and `app.js` with comprehensive Tamil translations for progress bar, policy parameters, and audit table headers.
+  - Integrated Web `SpeechSynthesis` API in `app.js` providing real-time voice prompts in Tamil (`ta-IN`) and English (`en-US`) for positioning, active challenges, and decision announcements.
+  - Added High-Contrast Mode toggle (`🌓 Contrast`) and pure-black/high-visibility CSS tokens.
+  - Added `aria-live="polite"` and `aria-live="assertive"` regions for screen-reader compatibility.
+- **Commit:** `feat(p3): judge mode split view, audit verifier cli, offline mediapipe, mosip receipt, docs honesty`
+- **Tests:** Verified localization strings in `LocalizationServiceTest`
+
+### [P3-6] Engine Hardening, RAM Cleanup & Docs Honesty Pass
+- **Finding:**
+  - `ImageIO.read` decompressed incoming images before dimension checks (decompression bomb vulnerability).
+  - Volatile frame buffers (`jpegBytes`, `int[] pixels`) lingered in RAM until garbage collection.
+  - Engine sessions and best compliant frames were never evicted after terminal decisions.
+  - Documentation, CODING_STANDARDS, and Javadocs claimed face area 0.15–0.75 and Laplacian variance $\ge 80$, whereas code enforced `0.08..0.75` and `35.0`.
+  - Repository claimed "production-ready" despite heuristic limitations.
+- **Resolution:**
+  - Implemented `ImageReader` header dimension parsing before raster decompression, dropping oversized frames ($>1280\times 1280$).
+  - Added explicit zeroing (`Arrays.fill`) for volatile pixel buffers and byte arrays immediately after frame processing in `WebSocketHandler.java`.
+  - Added `finishSession(session)` to `LivenessEngine` and `DefaultLivenessEngine` wiping `bestCompliantFrame` and evicting session context upon decision emission or socket closure.
+  - Aligned face area ratio (`0.08..0.75`) and Laplacian variance ($\ge 35.0$) across `README.md`, `CODING_STANDARDS.md`, and `QualityEvaluator.java`.
+  - Re-scoped project documentation to "Reference Implementation & Prototype".
+  - Created `THREAT_MODEL.md` and `ARCHITECTURE.md` with complete Mermaid sequence diagrams.
+  - Updated `DEMO.md` with 90-second pitch script and 3-minute Judge Mode walkthrough.
+- **Commit:** `feat(p3): judge mode split view, audit verifier cli, offline mediapipe, mosip receipt, docs honesty`
+- **Tests:** `mvn clean verify` green across all 7 modules
+

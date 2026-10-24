@@ -51,10 +51,10 @@
 
 ### ISO/IEC 19794-5 (Biometric Data Interchange Formats - Face Image Data)
 - Face positioning gate checks:
-  - Face dimensions: bounding box occupies between 15% and 75% of frame area.
+  - Face dimensions: bounding box occupies between 8% and 75% of frame area (`MIN_FACE_AREA_RATIO = 0.08`, `MAX_FACE_AREA_RATIO = 0.75`).
   - Pose tolerances: Yaw $\le 15^\circ$, Pitch $\le 15^\circ$, Roll $\le 15^\circ$.
   - Illumination: average luma between 0.20 and 0.85; absence of specular hotspots.
-  - Sharpness: Laplacian variance $\ge 80.0$ to filter motion blur.
+  - Sharpness: Laplacian variance $\ge 35.0$ to filter motion blur (`MIN_LAPLACIAN_VARIANCE = 35.0`).
   - Expression: neutral expression with mouth closed and both eyes open.
 
 ---

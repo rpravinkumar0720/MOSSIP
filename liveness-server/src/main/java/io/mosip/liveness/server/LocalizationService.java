@@ -79,11 +79,27 @@ public class LocalizationService {
         EN.put("DECISION_" + DecisionType.FAILED_MAX_RETRIES.name(), LivenessError.MAX_RETRIES_EXCEEDED.getDefaultUserMessage());
         EN.put("DECISION_ERROR", LivenessError.ENGINE_ERROR.getDefaultUserMessage());
 
-        TA.put("DECISION_" + DecisionType.ACCEPTED.name(), "முக சரிபார்ப்பு வெற்றிகரமாக முடிந்தது.");
-        TA.put("DECISION_" + DecisionType.REJECTED.name(), "முக சரிபார்ப்பை நிறைவு செய்ய முடியவில்லை. மீண்டும் முயற்சிக்கவும்.");
-        TA.put("DECISION_" + DecisionType.RETRY.name(), "மீண்டும் முயற்சிக்கவும்.");
-        TA.put("DECISION_" + DecisionType.FAILED_MAX_RETRIES.name(), "அதிகபட்ச முயற்சிகள் முடிவடைந்தது. மேற்பார்வையாளரைத் தொடர்பு கொள்ளவும்.");
-        TA.put("DECISION_ERROR", "கணினி பிழை ஏற்பட்டது. மீண்டும் முயற்சிக்கவும்.");
+        // Progress label, policy panel, and audit headers (English)
+        EN.put("PROGRESS_LABEL", "Passive Liveness");
+        EN.put("POLICY_HEADER", "Effective Policy Settings");
+        EN.put("POLICY_DESC", "Loaded from server policy registry");
+        EN.put("POLICY_PASSIVE_WINDOW", "Passive Frames Required");
+        EN.put("POLICY_PAD_THRESHOLD", "PAD Threshold");
+        EN.put("POLICY_ACTIVE_CHALLENGES", "Active Challenges");
+        EN.put("AUDIT_HEADER_EVENT", "Event Type");
+        EN.put("AUDIT_HEADER_DECISION", "Decision");
+        EN.put("AUDIT_HEADER_HASH", "Hash Linkage");
+
+        // Progress label, policy panel, and audit headers (Tamil)
+        TA.put("PROGRESS_LABEL", "செயலற்ற முக சரிபார்ப்பு");
+        TA.put("POLICY_HEADER", "செயலில் உள்ள கொள்கை அமைப்புகள்");
+        TA.put("POLICY_DESC", "சேவையக கொள்கை பதிவேட்டில் இருந்து ஏற்றப்பட்டது");
+        TA.put("POLICY_PASSIVE_WINDOW", "தேவையான செயலற்ற பிரேம்கள்");
+        TA.put("POLICY_PAD_THRESHOLD", "PAD வரம்பு");
+        TA.put("POLICY_ACTIVE_CHALLENGES", "செயலில் உள்ள சவால்கள்");
+        TA.put("AUDIT_HEADER_EVENT", "நிகழ்வு வகை");
+        TA.put("AUDIT_HEADER_DECISION", "முடிவு");
+        TA.put("AUDIT_HEADER_HASH", "ஹாஷ் இணைப்பு");
     }
 
     public static String getQualityGuidance(QualityFailureReason reason, String lang) {

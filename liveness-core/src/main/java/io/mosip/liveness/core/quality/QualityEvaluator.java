@@ -15,8 +15,8 @@ import java.util.Set;
 
 /**
  * ISO/IEC 19794-5 biometric face quality gate evaluator.
- * Enforces face area, pose angles (yaw, pitch, roll <= 15 deg), illumination (0.20 to 0.85),
- * sharpness (Laplacian variance >= 80), and neutral expression (eyes open, mouth closed).
+ * Enforces face area (0.08 to 0.75), pose angles (yaw, pitch, roll <= 15 deg), illumination (0.20 to 0.85),
+ * sharpness (Laplacian variance >= 35.0), and neutral expression (eyes open, mouth closed).
  */
 public final class QualityEvaluator {
 
@@ -115,7 +115,7 @@ public final class QualityEvaluator {
             failures.add(QualityFailureReason.TOO_BRIGHT);
         }
 
-        // 4. Sharpness / Blur check (Laplacian variance >= 80)
+        // 4. Sharpness / Blur check (Laplacian variance >= 35.0)
         double laplacianVar = ImageOps.laplacianVariance(gray, frame.getWidth(), frame.getHeight(), box);
         if (laplacianVar < MIN_LAPLACIAN_VARIANCE) {
             failures.add(QualityFailureReason.BLURRY);

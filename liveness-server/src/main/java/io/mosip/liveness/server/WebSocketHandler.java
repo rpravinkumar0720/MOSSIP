@@ -86,6 +86,7 @@ public class WebSocketHandler {
         long totalBytesReceived = 0L;
         long lastSeq = -1L;
         long lastTsMs = 0L;
+        long lastFrameLatencyMs = 0L;
 
         SocketSessionState(WsConnectContext ws, String lang, WorkflowType workflow,
                            String clientIdentity, String deviceId, boolean judgeMode, String clientIp) {
@@ -342,8 +343,10 @@ public class WebSocketHandler {
                 0
         );
 
+        long t0 = System.nanoTime();
         try {
             engine.processFrame(state.session, frame);
+            state.lastFrameLatencyMs = (System.nanoTime() - t0) / 1_000_000L;
             if (config.diagnosticMode() || state.judgeMode) {
                 sendDiagnosticIfAvailable(state);
             }
@@ -383,16 +386,23 @@ public class WebSocketHandler {
         diag.put("workflow", state.workflow.name());
         diag.put("retryCount", state.session.getRetryCount());
         diag.put("activeChallenge", state.session.getCurrentChallenge() != null ? state.session.getCurrentChallenge().type().name() : null);
+        diag.put("latencyMs", state.lastFrameLatencyMs);
 
-        Map<String, Object> weights = new LinkedHashMap<>();
-        weights.put("microMotion", 0.15);
-        weights.put("texture", 0.20);
-        weights.put("specular", 0.15);
-        weights.put("moire", 0.15);
-        weights.put("colorDistribution", 0.15);
-        weights.put("borderAnomaly", 0.10);
-        weights.put("timingJitter", 0.10);
-        diag.put("weights", weights);
+        // Fetch live per-signal heuristics and real-time PAD evaluation from engine
+        Map<String, Object> engineDiag = engine.getSessionDiagnostics(state.session);
+        if (!engineDiag.isEmpty()) {
+            diag.putAll(engineDiag);
+        } else {
+            Map<String, Object> weights = new LinkedHashMap<>();
+            weights.put("microMotion", 0.15);
+            weights.put("texture", 0.20);
+            weights.put("specular", 0.15);
+            weights.put("moire", 0.15);
+            weights.put("colorDistribution", 0.15);
+            weights.put("borderAnomaly", 0.10);
+            weights.put("timingJitter", 0.10);
+            diag.put("weights", weights);
+        }
 
         sendJson(state.ws, diag);
     }
@@ -405,7 +415,7 @@ public class WebSocketHandler {
                 count.decrementAndGet();
             }
             if (state.session != null && !state.session.isClosed()) {
-                engine.cancelSession(state.session);
+                engine.finishSession(state.session);
             }
         }
         log.info("WebSocket closed: socketId={}", ctx.sessionId());
@@ -505,6 +515,12 @@ public class WebSocketHandler {
                 }
 
                 sendJson(state.ws, resp);
+
+                if (decision.decisionType() == DecisionType.ACCEPTED
+                        || decision.decisionType() == DecisionType.REJECTED
+                        || decision.decisionType() == DecisionType.FAILED_MAX_RETRIES) {
+                    engine.finishSession(session);
+                }
             }
 
             @Override

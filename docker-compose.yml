@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  liveness-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mosip-liveness-server
+    environment:
+      - LIVENESS_PORT=8080
+      - LIVENESS_DEMO=false
+      - LIVENESS_ADMIN_TOKEN=mosip-admin-token-2026
+      - LIVENESS_LOCKOUT_SECONDS=30
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: mosip-liveness-caddy
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - liveness-server
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
