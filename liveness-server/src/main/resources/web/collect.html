@@ -56,9 +56,23 @@
         <div class="control-group">
           <label for="labelSelect">Presentation Class:</label>
           <select id="labelSelect" class="custom-select">
-            <option value="genuine">Genuine Live Subject</option>
-            <option value="print">Print Attack (Paper / Photo)</option>
-            <option value="replay">Screen Replay Attack (Phone / Tablet)</option>
+            <option value="genuine">Bona Fide (Genuine Live Subject)</option>
+            <option value="print">Print Attack (PAI Species 1 - Photo/Paper)</option>
+            <option value="replay_phone">Phone Screen Replay (PAI Species 2a)</option>
+            <option value="replay_tablet">Tablet Screen Replay (PAI Species 2b)</option>
+            <option value="mask">3D Silicone / Latex Mask (PAI Species 3)</option>
+          </select>
+        </div>
+
+        <div class="control-group">
+          <label for="challengeSelect">Active Challenge:</label>
+          <select id="challengeSelect" class="custom-select">
+            <option value="NONE">None (Passive Only)</option>
+            <option value="BLINK">Blink Eyes</option>
+            <option value="SMILE">Smile</option>
+            <option value="TURN_LEFT">Turn Head Left</option>
+            <option value="TURN_RIGHT">Turn Head Right</option>
+            <option value="COLOR_FLASH">Color Flash</option>
           </select>
         </div>
 
@@ -75,9 +89,10 @@
         <p><strong>Instructions:</strong></p>
         <ol style="padding-left: 20px;">
           <li>Position the live subject or attack presentation in front of the webcam.</li>
-          <li>Click "Start Recording". 10 consecutive frames will be captured at ~10 FPS.</li>
-          <li>Frames will be downloaded as JPEG files alongside matching <code>.json</code> sidecar files containing MediaPipe facial landmarks.</li>
-          <li>Organize into directories: <code>datasets/genuine/sample1/</code>, <code>datasets/print/sample1/</code>, etc. for evaluation via <code>liveness-eval.jar</code>.</li>
+          <li>Select the presentation category and expected active challenge.</li>
+          <li>Click "Start Recording". Consecutive frames (640x480 at q0.85) will be captured alongside facial landmarks.</li>
+          <li>Frames will be downloaded as JPEGs, <code>.json</code> landmark sidecars, and a matching <code>timeline.json</code> challenge timeline.</li>
+          <li>Organize into directories: <code>datasets/genuine/sample_01/</code>, <code>datasets/print/sample_01/</code>, etc. for evaluation via <code>liveness-eval</code>.</li>
         </ol>
       </div>
     </main>
@@ -113,36 +128,66 @@
 
     document.getElementById('btnStartCollect').addEventListener('click', async () => {
       const label = document.getElementById('labelSelect').value;
+      const challengeType = document.getElementById('challengeSelect').value;
       const totalFrames = parseInt(document.getElementById('frameCountInput').value, 10) || 10;
       const status = document.getElementById('collectStatus');
 
       status.innerText = `Recording 0/${totalFrames}...`;
-      const targetW = 400;
-      const targetH = Math.round(targetW * (video.videoHeight / video.videoWidth));
+      const targetW = 640;
+      const targetH = 480;
       canvas.width = targetW;
       canvas.height = targetH;
 
+      const timelineEvents = [];
+      const startTime = Date.now();
+
       for (let i = 0; i < totalFrames; i++) {
+        const frameTime = Date.now();
         ctx.drawImage(video, 0, 0, targetW, targetH);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
 
         let landmarks = [];
         if (faceLandmarker) {
           const res = faceLandmarker.detectForVideo(video, performance.now());
           if (res && res.faceLandmarks && res.faceLandmarks.length > 0) {
-            landmarks = res.faceLandmarks[0].map(p => [p.x, p.y, p.z || 0]);
+            landmarks = res.faceLandmarks[0].map(p => [
+              Math.round(p.x * 10000) / 10000,
+              Math.round(p.y * 10000) / 10000,
+              Math.round((p.z || 0) * 10000) / 10000
+            ]);
           }
         }
 
         const baseName = `frame_${String(i).padStart(3, '0')}`;
         downloadBlob(dataURItoBlob(dataUrl), `${baseName}.jpg`);
-        const jsonBlob = new Blob([JSON.stringify({ label, frameIndex: i, landmarks, timestampMs: Date.now() }, null, 2)], { type: 'application/json' });
+        const jsonBlob = new Blob([JSON.stringify({ label, frameIndex: i, landmarks, timestampMs: frameTime }, null, 2)], { type: 'application/json' });
         downloadBlob(jsonBlob, `${baseName}.json`);
 
+        timelineEvents.push({
+          frameIndex: i,
+          fileName: `${baseName}.jpg`,
+          relativeMs: frameTime - startTime,
+          hasLandmarks: landmarks.length > 0
+        });
+
         status.innerText = `Captured ${i + 1}/${totalFrames}`;
-        await new Promise(r => setTimeout(r, 100)); // 10 fps
+        await new Promise(r => setTimeout(r, 90)); // ~11 fps
       }
-      status.innerText = `Completed! Saved ${totalFrames} frames.`;
+
+      // Generate timeline.json
+      const timelinePayload = {
+        sequenceId: `seq-${Date.now()}`,
+        label: label,
+        challengeType: challengeType,
+        totalFrames: totalFrames,
+        durationMs: Date.now() - startTime,
+        capturedAt: new Date().toISOString(),
+        timeline: timelineEvents
+      };
+      const timelineBlob = new Blob([JSON.stringify(timelinePayload, null, 2)], { type: 'application/json' });
+      downloadBlob(timelineBlob, 'timeline.json');
+
+      status.innerText = `Completed! Saved ${totalFrames} frames & timeline.json.`;
     });
 
     function downloadBlob(blob, filename) {

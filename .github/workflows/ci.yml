@@ -22,8 +22,38 @@ jobs:
           java-version: '17'
           cache: 'maven'
 
-      - name: Compile and Test with Maven
+      - name: Compile and Test with Maven (with JaCoCo gate >= 70%)
         run: mvn clean verify -B
+
+      - name: Run SpotBugs Static Analysis
+        run: mvn com.github.spotbugs:spotbugs-maven-plugin:4.8.3.1:check -Dspotbugs.failOnError=false
+
+      - name: Run OWASP Dependency-Check
+        run: mvn org.owasp:dependency-check-maven:9.0.9:check -DfailOnError=false
+
+      - name: Run Liveness Benchmark on Procedural Manifold
+        run: |
+          mvn test -Dtest=GenerateBenchmarkDataset#generateAllDatasets
+          java -jar liveness-eval/target/liveness-eval-1.0.0-SNAPSHOT.jar \
+            --genuine liveness-eval/datasets/genuine \
+            --print liveness-eval/datasets/print \
+            --replay-phone liveness-eval/datasets/replay_phone \
+            --replay-tablet liveness-eval/datasets/replay_tablet \
+            --mask liveness-eval/datasets/mask \
+            --out docs/BENCHMARK_REPORT.md
+
+      - name: Upload Benchmark Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: iso-30107-benchmark-report
+          path: docs/BENCHMARK_REPORT.md
+
+      - name: Upload JaCoCo Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-coverage-report
+          path: '**/target/site/jacoco/**'
+          if-no-files-found: ignore
 
       - name: Archive Test Results
         if: always()
@@ -32,3 +62,15 @@ jobs:
           name: surefire-reports
           path: '**/target/surefire-reports/*.txt'
           if-no-files-found: ignore
+
+  docker-build:
+    name: Docker Build Validation
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker Container Image
+        run: docker build -t mosip/face-liveness:latest .

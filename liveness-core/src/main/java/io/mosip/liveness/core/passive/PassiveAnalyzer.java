@@ -264,7 +264,7 @@ public class PassiveAnalyzer {
             return 0.98;
         }
         if (avgResidual < 0.00025) {
-            return 0.20 + ((avgResidual - 0.00018) / 0.00007) * 0.78;
+            return Math.max(0.05, 0.20 + ((avgResidual - 0.00018) / 0.00007) * 0.78);
         }
         if (avgResidual <= 0.080) {
             return 0.85;

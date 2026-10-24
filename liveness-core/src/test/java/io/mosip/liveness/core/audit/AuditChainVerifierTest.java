@@ -223,5 +223,57 @@ class AuditChainVerifierTest {
         assertThat(resNoSig.valid()).isFalse();
         assertThat(resNoSig.message()).contains("signature missing");
     }
+
+    @Test
+    @DisplayName("P2-2: Property test - modifying ANY field in ANY event k in a chain of length N always breaks verification at k")
+    void testAuditChainPropertyTesting() {
+        java.util.Random rnd = new java.util.Random(42L);
+
+        for (int chainLen = 2; chainLen <= 12; chainLen++) {
+            List<LivenessAuditEvent> originalChain = createValidSessionChain("prop-sess-" + chainLen, chainLen);
+
+            // Property 1: Baseline valid chain always passes
+            AuditChainVerifier.AuditVerificationResult baseRes = AuditChainVerifier.verify(originalChain);
+            assertThat(baseRes.valid()).isTrue();
+
+            // Property 2: Modifying any field in event k always breaks verification at k
+            for (int k = 0; k < chainLen; k++) {
+                List<LivenessAuditEvent> tamperedChain = new ArrayList<>(originalChain);
+                LivenessAuditEvent target = tamperedChain.get(k);
+
+                // Modify one random attribute among: timestamp, passiveScore, padScore, details
+                int fieldChoice = rnd.nextInt(4);
+                LivenessAuditEvent modified = switch (fieldChoice) {
+                    case 0 -> new LivenessAuditEvent(target.eventId(), target.sessionId(), target.timestampMillis() + 9999L,
+                            target.workflow(), target.eventType(), target.decision(), target.passiveScore(),
+                            target.padClassification(), target.padScore(), target.challengeType(), target.errorCode(),
+                            target.modelVersion(), target.deviceId(), target.details(), target.previousHash(), target.currentHash());
+                    case 1 -> new LivenessAuditEvent(target.eventId(), target.sessionId(), target.timestampMillis(),
+                            target.workflow(), target.eventType(), target.decision(), target.passiveScore() + 0.05,
+                            target.padClassification(), target.padScore(), target.challengeType(), target.errorCode(),
+                            target.modelVersion(), target.deviceId(), target.details(), target.previousHash(), target.currentHash());
+                    case 2 -> new LivenessAuditEvent(target.eventId(), target.sessionId(), target.timestampMillis(),
+                            target.workflow(), target.eventType(), target.decision(), target.passiveScore(),
+                            target.padClassification(), 0.999, target.challengeType(), target.errorCode(),
+                            target.modelVersion(), target.deviceId(), target.details(), target.previousHash(), target.currentHash());
+                    default -> new LivenessAuditEvent(target.eventId(), target.sessionId(), target.timestampMillis(),
+                            target.workflow(), target.eventType(), target.decision(), target.passiveScore(),
+                            target.padClassification(), target.padScore(), target.challengeType(), target.errorCode(),
+                            target.modelVersion(), target.deviceId(), Map.of("tamperedKey", "tamperedVal"),
+                            target.previousHash(), target.currentHash());
+                };
+
+                tamperedChain.set(k, modified);
+                AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verify(tamperedChain);
+
+                assertThat(result.valid())
+                        .as("Tampered chain must be invalid (length=%d, tamperedIndex=%d, field=%d)", chainLen, k, fieldChoice)
+                        .isFalse();
+                assertThat(result.firstBrokenIndex())
+                        .as("First broken index must match tampered index k")
+                        .isEqualTo(k);
+            }
+        }
+    }
 }
 

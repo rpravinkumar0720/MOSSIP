@@ -1,0 +1,11 @@
+target/
+**/target/
+.git/
+.github/
+.idea/
+*.iml
+*.log
+.DS_Store
+datasets/
+**/datasets/
+models/*.onnx

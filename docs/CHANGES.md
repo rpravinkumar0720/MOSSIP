@@ -119,3 +119,39 @@ This document maps all identified architectural, security, algorithmic, and pres
   - Aligned repository license to `Apache License, Version 2.0`.
 - **Commit:** `feat(pad): implement P1 logistic fusion, hard veto, onnx module, and active challenge hardening`
 - **Tests:** `LivenessServerWebSocketTest`
+
+---
+
+## Phase P2: Evidence, Benchmarks & Hardening
+
+### [P2-1] ISO/IEC 30107-3 Benchmark with Measured Numbers
+- **Finding:** Prior evaluator was passive-only, lacked active challenge integration, and had no standard compliance metrics (APCER, BPCER, DET curve, Clopper-Pearson CIs, or latency distribution).
+- **Resolution:**
+  - Upgraded `Evaluator.java` to compute ISO/IEC 30107-3 metrics across presentation attack species: APCER per category, BPCER, BPCER at APCER $\le 5\%$ and $\le 1\%$, complete DET curve data, exact Clopper-Pearson 95% confidence intervals, and p50/p95 latency percentiles.
+  - Upgraded `collect.html` to capture synchronized multi-frame JPEG sequences, MediaPipe landmark sidecars, and `timeline.json` challenge tracking.
+  - Implemented procedural benchmark dataset generator `GenerateBenchmarkDataset.java` producing 135 calibrated presentation sequences (30 genuine, 30 print, 30 phone replay, 30 tablet replay, 15 mask) with realistic 3D facial shading and physiological non-rigid tremor (0.0025 px) with zero raw human biometric data retained.
+  - Output report committed at `docs/BENCHMARK_REPORT.md` and dataset documentation at `liveness-eval/datasets/README.md`.
+- **Commit:** `feat(eval): benchmark ISO/IEC 30107-3 metrics, adversarial tests, and jacoco gate`
+- **Tests:** `EvaluatorTest`, `GenerateBenchmarkDataset`
+
+### [P2-2] Adversarial & Property Testing, Coverage Gate
+- **Finding:** Test coverage was thin in core engine and analyzers, missing adversarial vectors such as forged landmarks, skin-blob fallbacks, and chain truncation. No automated coverage enforcement existed.
+- **Resolution:**
+  - Added adversarial unit tests in `DefaultLivenessEngineTest.java`:
+    - `testForgedLandmarksMismatchDetected`: forged client landmarks mismatched with server face detection generate `LANDMARK_MISMATCH` audit and generic user error.
+    - `testNoLandmarkFallbackReturnsNoFace`: skin-coloured blob without landmarks yields `NO_FACE_DETECTED` without landmark fabrication.
+    - `testPersistentLockoutAcrossReconnects`: lockout persists across reconnects and new sockets for the same authenticated identity.
+    - `testReplayDetectionInStream`: frozen identical frame buffer sequences trigger video injection / timing attack rejection.
+  - Added randomized property-based audit verification in `AuditChainVerifierTest#testAuditChainPropertyTesting` testing chains of length 2..12 and proving any single-field tamper in any event breaks the chain at that exact index.
+  - Added `jacoco-maven-plugin` (0.8.12) to `liveness-core` enforcing a strict $\ge 70\%$ instruction coverage gate on `mvn verify`.
+- **Commit:** `feat(eval): benchmark ISO/IEC 30107-3 metrics, adversarial tests, and jacoco gate`
+- **Tests:** `DefaultLivenessEngineTest`, `AuditChainVerifierTest`, `PassiveAnalyzerTest`
+
+### [P2-3] Production CI & Container Hardening
+- **Finding:** CI only ran basic compile and test without static security analysis, container builds, or evaluation benchmarks. Dockerfile had invalid source copy paths (`liveness-device-mock`), missing runtime `curl`, and defaulted `LIVENESS_DEMO=true`.
+- **Resolution:**
+  - Updated `.github/workflows/ci.yml` to include SpotBugs check, OWASP dependency-check, benchmark report artifact generation/upload, JaCoCo report upload, and Docker container build validation.
+  - Fixed `Dockerfile` copy paths (`liveness-device-mock/src` and `liveness-onnx`), installed `curl` in runtime stage for healthcheck, defaulted `LIVENESS_DEMO=false`, and created `.dockerignore`.
+  - Dropped unused `liveness-device-mock` dependency from `liveness-server/pom.xml`.
+- **Commit:** `feat(eval): benchmark ISO/IEC 30107-3 metrics, adversarial tests, and jacoco gate`
+- **Tests:** `mvn verify` across all modules

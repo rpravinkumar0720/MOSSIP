@@ -26,10 +26,6 @@
             <artifactId>liveness-core</artifactId>
         </dependency>
         <dependency>
-            <groupId>io.mosip.liveness</groupId>
-            <artifactId>liveness-device-mock</artifactId>
-        </dependency>
-        <dependency>
             <groupId>io.javalin</groupId>
             <artifactId>javalin</artifactId>
         </dependency>

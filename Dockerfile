@@ -8,6 +8,7 @@ WORKDIR /build
 COPY pom.xml .
 COPY liveness-api/pom.xml liveness-api/
 COPY liveness-core/pom.xml liveness-core/
+COPY liveness-onnx/pom.xml liveness-onnx/
 COPY liveness-device-mock/pom.xml liveness-device-mock/
 COPY liveness-server/pom.xml liveness-server/
 COPY liveness-eval/pom.xml liveness-eval/
@@ -18,7 +19,8 @@ RUN mvn dependency:go-offline -B -DskipTests || true
 # Copy all source trees
 COPY liveness-api/src liveness-api/src
 COPY liveness-core/src liveness-core/src
-COPY liveness-device-mock/src liveness-device-mock/
+COPY liveness-onnx/src liveness-onnx/src
+COPY liveness-device-mock/src liveness-device-mock/src
 COPY liveness-server/src liveness-server/src
 COPY liveness-eval/src liveness-eval/src
 
@@ -29,12 +31,13 @@ RUN mvn clean package -DskipTests -B
 FROM eclipse-temurin:17-jre-jammy
 
 LABEL maintainer="MOSIP Community <info@mosip.io>"
-LABEL description="Production-ready MOSIP Face Liveness & PAD Service (ISO/IEC 19794-5 & ISO 30107-3 Baseline)"
+LABEL description="MOSIP Face Liveness & PAD Service (ISO/IEC 19794-5 & ISO 30107-3 Reference Implementation)"
 
 WORKDIR /app
 
-# Non-root service user for production container hardening
-RUN groupadd -r mosip && useradd -r -g mosip mosip
+# Install curl for HEALTHCHECK and create non-root service user
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r mosip && useradd -r -g mosip mosip
 
 # Copy shaded fat JAR from build stage
 COPY --from=builder /build/liveness-server/target/liveness-server-1.0.0-SNAPSHOT.jar /app/liveness-server.jar
@@ -42,7 +45,7 @@ COPY --from=builder /build/liveness-server/target/liveness-server-1.0.0-SNAPSHOT
 # Configuration defaults
 ENV PORT=8080 \
     LIVENESS_DIAGNOSTIC=false \
-    LIVENESS_DEMO=true \
+    LIVENESS_DEMO=false \
     LIVENESS_LOCKOUT_SECONDS=60
 
 USER mosip
