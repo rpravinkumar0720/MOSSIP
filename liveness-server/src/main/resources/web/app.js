@@ -20,6 +20,7 @@ let lastCaptureTime = 0;
 let activeChallengeTimer = null;
 let localAuditEvents = [];
 let reconnectAttempts = 0;
+let adminToken = sessionStorage.getItem('mosip_admin_token') || (new URLSearchParams(window.location.search)).get('adminToken') || '';
 
 // Localization Strings for Web UI
 const UI_STRINGS = {
@@ -64,6 +65,7 @@ const UI_STRINGS = {
 document.addEventListener('DOMContentLoaded', async () => {
   initElements();
   initEventListeners();
+  updateJudgeModeUI();
   loadPolicyDetails(currentWorkflow);
   checkServerHealth();
   connectWebSocket();
@@ -137,6 +139,45 @@ function initEventListeners() {
       requestAnimationFrame(processVideoFrame);
     }
   });
+
+  document.getElementById('btnJudgeMode')?.addEventListener('click', () => {
+    if (adminToken) {
+      if (confirm('Judge Mode is currently active. Would you like to exit Judge Mode?')) {
+        adminToken = '';
+        sessionStorage.removeItem('mosip_admin_token');
+        updateJudgeModeUI();
+        loadPolicyDetails(currentWorkflow);
+        resetAndReconnect();
+      }
+    } else {
+      const token = prompt('Enter Admin/Judge Token (LIVENESS_ADMIN_TOKEN):', 'mosip-admin-token-2026');
+      if (token && token.trim()) {
+        adminToken = token.trim();
+        sessionStorage.setItem('mosip_admin_token', adminToken);
+        updateJudgeModeUI();
+        loadPolicyDetails(currentWorkflow);
+        resetAndReconnect();
+      }
+    }
+  });
+}
+
+function updateJudgeModeUI() {
+  const btn = document.getElementById('btnJudgeMode');
+  const tabDiag = document.getElementById('tabBtnDiag');
+  if (btn) {
+    if (adminToken) {
+      btn.innerText = '⚖️ Judge: ON';
+      btn.style.background = 'rgba(16, 185, 129, 0.2)';
+      btn.style.borderColor = '#10b981';
+      tabDiag?.classList.remove('hidden');
+    } else {
+      btn.innerText = '⚖️ Judge Mode';
+      btn.style.background = '';
+      btn.style.borderColor = '';
+      tabDiag?.classList.add('hidden');
+    }
+  }
 }
 
 function updateLanguage() {
@@ -208,13 +249,45 @@ async function initCamera() {
 }
 
 // WebSocket Connection Management
-function connectWebSocket() {
+async function connectWebSocket() {
   if (websocket && websocket.readyState === WebSocket.OPEN) {
     websocket.close();
   }
 
+  updateStatus(false, 'Authorizing session...');
+  let sessionToken = '';
+  try {
+    let clientId = localStorage.getItem('mosip_client_id');
+    if (!clientId) {
+      clientId = 'client-' + Math.random().toString(36).substring(2, 10);
+      localStorage.setItem('mosip_client_id', clientId);
+    }
+
+    const sessionRes = await fetch('/api/v1/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        workflow: currentWorkflow,
+        clientIdentity: clientId
+      })
+    });
+    if (sessionRes.ok) {
+      const sData = await sessionRes.json();
+      sessionToken = sData.token;
+      currentSessionId = sData.sessionId;
+    }
+  } catch (err) {
+    console.warn('Could not pre-issue session token, proceeding with WS connect:', err);
+  }
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${protocol}//${window.location.host}/ws/liveness?workflow=${currentWorkflow}&lang=${currentLang}`;
+  let wsUrl = `${protocol}//${window.location.host}/ws/liveness?workflow=${currentWorkflow}&lang=${currentLang}`;
+  if (sessionToken) {
+    wsUrl += `&token=${encodeURIComponent(sessionToken)}`;
+  }
+  if (adminToken) {
+    wsUrl += `&adminToken=${encodeURIComponent(adminToken)}`;
+  }
 
   updateStatus(false, 'Connecting...');
   websocket = new WebSocket(wsUrl);
@@ -454,13 +527,24 @@ function handleDecision(decision) {
     : (UI_STRINGS[currentLang] || UI_STRINGS.en).verifFailed;
 
   message.innerText = decision.userMessage;
-  score.innerText = (decision.score || 0).toFixed(2);
-  sid.innerText = decision.sessionId || '-';
+  if (decision.score !== undefined && decision.score !== null) {
+    score.innerText = decision.score.toFixed(2);
+    document.getElementById('decisionScoreRow')?.classList.remove('hidden');
+  } else {
+    document.getElementById('decisionScoreRow')?.classList.add('hidden');
+  }
+
+  if (decision.sessionId) {
+    sid.innerText = decision.sessionId;
+    document.getElementById('decisionSessionIdRow')?.classList.remove('hidden');
+  } else {
+    document.getElementById('decisionSessionIdRow')?.classList.add('hidden');
+  }
 
   overlay.classList.remove('hidden');
 
   // Automatically refresh audit trail for this session
-  if (currentSessionId) {
+  if (currentSessionId && adminToken) {
     fetchAuditTrail(currentSessionId);
   }
 }
@@ -478,8 +562,18 @@ function resetAndReconnect() {
 // Audit Chain REST API Interactions
 async function fetchAuditTrail(sessionId) {
   try {
-    const res = await fetch(`/api/audit/${sessionId}`);
-    if (!res.ok) return;
+    const headers = {};
+    if (adminToken) {
+      headers['Authorization'] = `Bearer ${adminToken}`;
+    }
+    const res = await fetch(`/api/audit/${sessionId}`, { headers });
+    if (!res.ok) {
+      if (res.status === 401) {
+        localAuditEvents = [];
+        renderAuditTable([]);
+      }
+      return;
+    }
     localAuditEvents = await res.json();
     renderAuditTable(localAuditEvents);
   } catch (err) {
@@ -517,6 +611,10 @@ function renderAuditTable(events) {
 async function verifyAuditChain() {
   const badge = document.getElementById('chainVerificationBadge');
   const text = document.getElementById('chainVerificationText');
+  const headers = {};
+  if (adminToken) {
+    headers['Authorization'] = `Bearer ${adminToken}`;
+  }
 
   // If localAuditEvents is empty, attempt to fetch from session or system audit trail
   if (!localAuditEvents || localAuditEvents.length === 0) {
@@ -525,7 +623,7 @@ async function verifyAuditChain() {
     }
     if (!localAuditEvents || localAuditEvents.length === 0) {
       try {
-        const resAll = await fetch('/api/audit');
+        const resAll = await fetch('/api/audit', { headers });
         if (resAll.ok) {
           const events = await resAll.json();
           if (events && events.length > 0) {
@@ -542,7 +640,14 @@ async function verifyAuditChain() {
   // If still no events recorded, query global audit verification
   if (!localAuditEvents || localAuditEvents.length === 0) {
     try {
-      const res = await fetch('/api/audit/verify');
+      const res = await fetch('/api/audit/verify', { headers });
+      if (res.status === 401) {
+        badge.classList.remove('hidden');
+        badge.className = 'verification-badge invalid';
+        badge.querySelector('.badge-icon').innerText = '🔒';
+        text.innerText = 'Audit verification requires Admin/Judge Token (click Judge Mode).';
+        return;
+      }
       const result = await res.json();
       badge.classList.remove('hidden');
       if (result.valid) {
@@ -562,11 +667,22 @@ async function verifyAuditChain() {
   }
 
   try {
+    const postHeaders = { 'Content-Type': 'application/json' };
+    if (adminToken) {
+      postHeaders['Authorization'] = `Bearer ${adminToken}`;
+    }
     const res = await fetch('/api/audit/verify', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: postHeaders,
       body: JSON.stringify(localAuditEvents)
     });
+    if (res.status === 401) {
+      badge.classList.remove('hidden');
+      badge.className = 'verification-badge invalid';
+      badge.querySelector('.badge-icon').innerText = '🔒';
+      text.innerText = 'Audit verification requires Admin/Judge Token (click Judge Mode).';
+      return;
+    }
     const result = await res.json();
 
     badge.classList.remove('hidden');
@@ -585,13 +701,17 @@ async function verifyAuditChain() {
 }
 
 async function tamperAndVerifyAuditChain() {
+  const headers = {};
+  if (adminToken) {
+    headers['Authorization'] = `Bearer ${adminToken}`;
+  }
   if (!localAuditEvents || localAuditEvents.length === 0) {
     if (currentSessionId) {
       await fetchAuditTrail(currentSessionId);
     }
     if (!localAuditEvents || localAuditEvents.length === 0) {
       try {
-        const resAll = await fetch('/api/audit');
+        const resAll = await fetch('/api/audit', { headers });
         if (resAll.ok) {
           const events = await resAll.json();
           if (events && events.length > 0) {
@@ -604,7 +724,7 @@ async function tamperAndVerifyAuditChain() {
   }
 
   if (!localAuditEvents || localAuditEvents.length === 0) {
-    alert('No audit events available to tamper. Please complete a session first.');
+    alert('No audit events available to tamper. Please complete a session first or enable Judge Mode.');
     return;
   }
 
@@ -617,11 +737,19 @@ async function tamperAndVerifyAuditChain() {
   renderAuditTable(tamperedChain);
 
   try {
+    const postHeaders = { 'Content-Type': 'application/json' };
+    if (adminToken) {
+      postHeaders['Authorization'] = `Bearer ${adminToken}`;
+    }
     const res = await fetch('/api/audit/verify', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: postHeaders,
       body: JSON.stringify(tamperedChain)
     });
+    if (res.status === 401) {
+      alert('Audit verification requires Admin/Judge Token (click Judge Mode).');
+      return;
+    }
     const result = await res.json();
 
     const badge = document.getElementById('chainVerificationBadge');
@@ -639,8 +767,18 @@ async function tamperAndVerifyAuditChain() {
 async function loadPolicyDetails(workflow) {
   const container = document.getElementById('policyDetailsContainer');
   try {
-    const res = await fetch(`/api/policy/${workflow}`);
-    if (!res.ok) throw new Error('Policy request failed');
+    const headers = {};
+    if (adminToken) {
+      headers['Authorization'] = `Bearer ${adminToken}`;
+    }
+    const res = await fetch(`/api/policy/${workflow}`, { headers });
+    if (!res.ok) {
+      if (res.status === 401) {
+        container.innerHTML = `<div class="policy-loading" style="color:var(--text-muted);font-size:0.85rem;">🔒 Policy parameters are protected. Click <strong>⚖️ Judge Mode</strong> in header to enter token.</div>`;
+        return;
+      }
+      throw new Error('Policy request failed');
+    }
     const p = await res.json();
 
     container.innerHTML = `

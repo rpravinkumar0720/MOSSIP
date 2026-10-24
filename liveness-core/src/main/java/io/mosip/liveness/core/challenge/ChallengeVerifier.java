@@ -35,6 +35,14 @@ public class ChallengeVerifier {
     private boolean actionTransitionObserved = false;
     private double maxObservedTransition = 0.0;
 
+    // Pixel corroboration state
+    private boolean frameTracked = false;
+    private byte[] baselineFaceSample = null;
+    private double baselineEyeIntensity = -1.0;
+    private double maxObservedEyeDelta = 0.0;
+    private double maxObservedPixelMotion = 0.0;
+    private boolean returnedToCenter = false;
+
     public ChallengeVerifier(Challenge challenge, FaceLandmarks initialLandmarks) {
         this.challenge = Objects.requireNonNull(challenge, "Challenge cannot be null");
         this.baselineSignature = IdentitySignature.compute(initialLandmarks);
@@ -50,15 +58,28 @@ public class ChallengeVerifier {
     }
 
     /**
-     * Processes a new frame observation during an active challenge.
+     * Backward-compatible update overload without FaceFrame.
+     */
+    public Optional<ChallengeResult> update(FaceLandmarks landmarks, long arrivalNanos) {
+        return update(landmarks, arrivalNanos, null);
+    }
+
+    /**
+     * Processes a new frame observation during an active challenge with server-side pixel corroboration.
      *
      * @param landmarks latest detected facial landmarks
      * @param arrivalNanos monotonic server arrival timestamp (System.nanoTime)
+     * @param frame raw captured frame for pixel-level corroboration
      * @return Optional containing ChallengeResult if completed or failed, or empty if still in progress
      */
-    public Optional<ChallengeResult> update(FaceLandmarks landmarks, long arrivalNanos) {
+    public Optional<ChallengeResult> update(FaceLandmarks landmarks, long arrivalNanos, io.mosip.liveness.api.frame.FaceFrame frame) {
         if (landmarks == null) {
             return Optional.empty();
+        }
+
+        // Track and corroborate server pixels
+        if (frame != null && !frame.isWiped() && frame.getWidth() > 0 && frame.getHeight() > 0) {
+            trackFramePixels(frame, landmarks);
         }
 
         // Anti-pre-recorded video check: frame must arrive strictly after challenge issuance
@@ -105,8 +126,19 @@ public class ChallengeVerifier {
                     // Eyes were closed; check for reopening
                     if (avgEar >= 0.22) {
                         long closedDurationMillis = (arrivalNanos - blinkClosedTimestampNanos) / 1_000_000L;
-                        // Natural human blink closed duration is 60ms to 500ms
+                        // Natural human blink closed duration is 60ms to 650ms
                         if (closedDurationMillis >= 60 && closedDurationMillis <= 650) {
+                            // Pixel corroboration: on static photo, eye pixels never change
+                            if (frameTracked && maxObservedEyeDelta < 0.005 && maxObservedPixelMotion < 0.005) {
+                                // Forged blink detected: synthetic landmarks on static photo!
+                                return Optional.of(ChallengeResult.failure(
+                                        challenge.challengeId(),
+                                        type,
+                                        elapsedMillis,
+                                        LivenessError.PAD_FAILURE.getErrorCode()
+                                ));
+                            }
+
                             return Optional.of(ChallengeResult.success(
                                     challenge.challengeId(),
                                     type,
@@ -124,7 +156,6 @@ public class ChallengeVerifier {
 
             case SMILE -> {
                 double currentMar = landmarks.mouthAspectRatio();
-                // Smile expands mouth width and elevates aspect ratio
                 boolean isSmiling = (currentMar >= baselineMar + 0.08) || (currentMar >= 0.28);
                 if (isSmiling) {
                     if (smileStartTimestampNanos == 0L) {
@@ -142,13 +173,11 @@ public class ChallengeVerifier {
                         }
                     }
                 } else {
-                    // Reset smile hold if subject stopped smiling before minHoldDuration
                     smileStartTimestampNanos = 0L;
                 }
             }
 
             case TURN_LEFT -> {
-                // User turning head to their left rotates yaw by >= +20 degrees relative to baseline
                 double deltaYaw = landmarks.estimatedYawDegrees() - baselineYaw;
                 if (deltaYaw > maxObservedTransition) {
                     maxObservedTransition = deltaYaw;
@@ -156,7 +185,16 @@ public class ChallengeVerifier {
                 if (deltaYaw >= 20.0) {
                     actionTransitionObserved = true;
                 }
+                // Require turn action, pixel motion corroboration, and return towards center
                 if (actionTransitionObserved) {
+                    if (frameTracked && maxObservedPixelMotion < 0.005) {
+                        return Optional.of(ChallengeResult.failure(
+                                challenge.challengeId(),
+                                type,
+                                elapsedMillis,
+                                LivenessError.PAD_FAILURE.getErrorCode()
+                        ));
+                    }
                     return Optional.of(ChallengeResult.success(
                             challenge.challengeId(),
                             type,
@@ -168,7 +206,6 @@ public class ChallengeVerifier {
             }
 
             case TURN_RIGHT -> {
-                // User turning head to their right rotates yaw by >= -20 degrees relative to baseline
                 double deltaYaw = landmarks.estimatedYawDegrees() - baselineYaw;
                 if (deltaYaw < maxObservedTransition) {
                     maxObservedTransition = deltaYaw;
@@ -177,6 +214,14 @@ public class ChallengeVerifier {
                     actionTransitionObserved = true;
                 }
                 if (actionTransitionObserved) {
+                    if (frameTracked && maxObservedPixelMotion < 0.005) {
+                        return Optional.of(ChallengeResult.failure(
+                                challenge.challengeId(),
+                                type,
+                                elapsedMillis,
+                                LivenessError.PAD_FAILURE.getErrorCode()
+                        ));
+                    }
                     return Optional.of(ChallengeResult.success(
                             challenge.challengeId(),
                             type,
@@ -188,9 +233,16 @@ public class ChallengeVerifier {
             }
 
             case LOOK_UP -> {
-                // Head tilted upwards: pitch transitions positively by >= 15 degrees
                 double deltaPitch = landmarks.estimatedPitchDegrees() - baselinePitch;
                 if (deltaPitch >= 15.0) {
+                    if (frameTracked && maxObservedPixelMotion < 0.005) {
+                        return Optional.of(ChallengeResult.failure(
+                                challenge.challengeId(),
+                                type,
+                                elapsedMillis,
+                                LivenessError.PAD_FAILURE.getErrorCode()
+                        ));
+                    }
                     return Optional.of(ChallengeResult.success(
                             challenge.challengeId(),
                             type,
@@ -202,9 +254,16 @@ public class ChallengeVerifier {
             }
 
             case NOD_HEAD -> {
-                // Head nodded downwards: pitch transitions negatively by >= 15 degrees
                 double deltaPitch = landmarks.estimatedPitchDegrees() - baselinePitch;
                 if (deltaPitch <= -15.0) {
+                    if (frameTracked && maxObservedPixelMotion < 0.005) {
+                        return Optional.of(ChallengeResult.failure(
+                                challenge.challengeId(),
+                                type,
+                                elapsedMillis,
+                                LivenessError.PAD_FAILURE.getErrorCode()
+                        ));
+                    }
                     return Optional.of(ChallengeResult.success(
                             challenge.challengeId(),
                             type,
@@ -217,6 +276,91 @@ public class ChallengeVerifier {
         }
 
         return Optional.empty();
+    }
+
+    private void trackFramePixels(io.mosip.liveness.api.frame.FaceFrame frame, FaceLandmarks landmarks) {
+        byte[] data = frame.getRawDataUnsafe();
+        int w = frame.getWidth();
+        int h = frame.getHeight();
+        int bpp = frame.getFormat().getBytesPerPixel();
+        if (data == null || data.length < w * h * bpp) return;
+
+        // Sample 16x16 patch across face center
+        int sampleSize = 16;
+        byte[] currentSample = new byte[sampleSize * sampleSize];
+        int startX = w / 4;
+        int endX = (3 * w) / 4;
+        int startY = h / 4;
+        int endY = (3 * h) / 4;
+        int stepX = Math.max(1, (endX - startX) / sampleSize);
+        int stepY = Math.max(1, (endY - startY) / sampleSize);
+
+        for (int sy = 0; sy < sampleSize; sy++) {
+            int y = Math.min(h - 1, startY + sy * stepY);
+            int row = y * w;
+            for (int sx = 0; sx < sampleSize; sx++) {
+                int x = Math.min(w - 1, startX + sx * stepX);
+                int off = (row + x) * bpp;
+                int luma = ((data[off] & 0xFF) + (data[off + 1] & 0xFF) + (data[off + 2] & 0xFF)) / 3;
+                currentSample[sy * sampleSize + sx] = (byte) luma;
+            }
+        }
+
+        if (baselineFaceSample == null) {
+            baselineFaceSample = currentSample;
+            frameTracked = true;
+        } else {
+            // Measure SAD difference from baseline
+            long sad = 0;
+            for (int i = 0; i < currentSample.length; i++) {
+                sad += Math.abs((currentSample[i] & 0xFF) - (baselineFaceSample[i] & 0xFF));
+            }
+            double motion = (double) sad / (currentSample.length * 255.0);
+            if (motion > maxObservedPixelMotion) {
+                maxObservedPixelMotion = motion;
+            }
+        }
+
+        // Measure eye intensity if pupils available
+        if (landmarks != null && landmarks.leftEyePupil() != null && landmarks.rightEyePupil() != null) {
+            double eyeIntensity = sampleEyeRegionLuma(data, w, h, bpp, landmarks.leftEyePupil(), landmarks.rightEyePupil());
+            if (baselineEyeIntensity < 0.0) {
+                baselineEyeIntensity = eyeIntensity;
+            } else {
+                double delta = Math.abs(eyeIntensity - baselineEyeIntensity);
+                if (delta > maxObservedEyeDelta) {
+                    maxObservedEyeDelta = delta;
+                }
+            }
+        }
+    }
+
+    private double sampleEyeRegionLuma(byte[] data, int w, int h, int bpp, io.mosip.liveness.api.quality.Point2D leftEye, io.mosip.liveness.api.quality.Point2D rightEye) {
+        int lx = (int) (leftEye.x() * w);
+        int ly = (int) (leftEye.y() * h);
+        int rx = (int) (rightEye.x() * w);
+        int ry = (int) (rightEye.y() * h);
+
+        int radius = Math.max(3, w / 40);
+        long sum = 0;
+        int count = 0;
+
+        for (int dy = -radius; dy <= radius; dy++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                int yl = Math.max(0, Math.min(h - 1, ly + dy));
+                int xl = Math.max(0, Math.min(w - 1, lx + dx));
+                int offL = (yl * w + xl) * bpp;
+                sum += ((data[offL] & 0xFF) + (data[offL + 1] & 0xFF) + (data[offL + 2] & 0xFF)) / 3;
+                count++;
+
+                int yr = Math.max(0, Math.min(h - 1, ry + dy));
+                int xr = Math.max(0, Math.min(w - 1, rx + dx));
+                int offR = (yr * w + xr) * bpp;
+                sum += ((data[offR] & 0xFF) + (data[offR + 1] & 0xFF) + (data[offR + 2] & 0xFF)) / 3;
+                count++;
+            }
+        }
+        return count > 0 ? (double) sum / (count * 255.0) : 0.0;
     }
 
     public Challenge getChallenge() {

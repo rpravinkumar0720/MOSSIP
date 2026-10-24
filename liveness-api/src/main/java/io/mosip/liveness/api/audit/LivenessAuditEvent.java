@@ -36,8 +36,32 @@ public record LivenessAuditEvent(
         String deviceId,
         Map<String, String> details,
         String previousHash,
-        String currentHash
+        String currentHash,
+        String signature
 ) {
+    public LivenessAuditEvent(
+            String eventId,
+            String sessionId,
+            long timestampMillis,
+            WorkflowType workflow,
+            AuditEventType eventType,
+            DecisionType decision,
+            Double passiveScore,
+            PadClassification padClassification,
+            Double padScore,
+            ChallengeType challengeType,
+            String errorCode,
+            String modelVersion,
+            String deviceId,
+            Map<String, String> details,
+            String previousHash,
+            String currentHash
+    ) {
+        this(eventId, sessionId, timestampMillis, workflow, eventType, decision, passiveScore,
+                padClassification, padScore, challengeType, errorCode, modelVersion, deviceId,
+                details, previousHash, currentHash, null);
+    }
+
     public LivenessAuditEvent {
         Objects.requireNonNull(eventId, "eventId cannot be null");
         Objects.requireNonNull(sessionId, "sessionId cannot be null");
@@ -51,7 +75,32 @@ public record LivenessAuditEvent(
     }
 
     /**
-     * Computes the deterministic SHA-256 hash over the event payload concatenated with previousHash.
+     * Serializes details map into canonical, key-sorted JSON to ensure deterministic hashing.
+     */
+    public static String canonicalJsonDetails(Map<String, String> details) {
+        if (details == null || details.isEmpty()) {
+            return "{}";
+        }
+        java.util.List<String> sortedKeys = new java.util.ArrayList<>(details.keySet());
+        Collections.sort(sortedKeys);
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < sortedKeys.size(); i++) {
+            String k = sortedKeys.get(i);
+            String v = details.get(k);
+            if (i > 0) sb.append(",");
+            sb.append("\"").append(escapeJson(k)).append("\":\"").append(escapeJson(v != null ? v : "")).append("\"");
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private static String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
+    }
+
+    /**
+     * Computes the deterministic SHA-256 hash over the event payload including canonical details concatenated with previousHash.
      */
     public static String computeHash(String previousHash,
                                      String eventId,
@@ -66,7 +115,8 @@ public record LivenessAuditEvent(
                                      ChallengeType challengeType,
                                      String errorCode,
                                      String modelVersion,
-                                     String deviceId) {
+                                     String deviceId,
+                                     Map<String, String> details) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             String canonicalString = (previousHash != null ? previousHash : "GENESIS") + "|"
@@ -82,13 +132,65 @@ public record LivenessAuditEvent(
                     + (challengeType != null ? challengeType.name() : "NULL") + "|"
                     + (errorCode != null ? errorCode : "NULL") + "|"
                     + (modelVersion != null ? modelVersion : "NULL") + "|"
-                    + (deviceId != null ? deviceId : "NULL");
+                    + (deviceId != null ? deviceId : "NULL") + "|"
+                    + canonicalJsonDetails(details);
 
             byte[] hashBytes = digest.digest(canonicalString.getBytes(StandardCharsets.UTF_8));
             return HexFormat.of().formatHex(hashBytes);
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 message digest algorithm not available", e);
         }
+    }
+
+    /**
+     * Backward-compatible computeHash overload omitting details.
+     */
+    public static String computeHash(String previousHash,
+                                     String eventId,
+                                     String sessionId,
+                                     long timestampMillis,
+                                     WorkflowType workflow,
+                                     AuditEventType eventType,
+                                     DecisionType decision,
+                                     Double passiveScore,
+                                     PadClassification padClassification,
+                                     Double padScore,
+                                     ChallengeType challengeType,
+                                     String errorCode,
+                                     String modelVersion,
+                                     String deviceId) {
+        return computeHash(previousHash, eventId, sessionId, timestampMillis, workflow, eventType,
+                decision, passiveScore, padClassification, padScore, challengeType, errorCode,
+                modelVersion, deviceId, Collections.emptyMap());
+    }
+
+    /**
+     * Computes HMAC-SHA256 signature over currentHash using the specified secret key.
+     */
+    public static String computeHmacSignature(String secretKey, String hash) {
+        if (secretKey == null || secretKey.isBlank() || hash == null) {
+            return null;
+        }
+        try {
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            javax.crypto.spec.SecretKeySpec keySpec = new javax.crypto.spec.SecretKeySpec(
+                    secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+            mac.init(keySpec);
+            byte[] sigBytes = mac.doFinal(hash.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(sigBytes);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to compute HMAC-SHA256 signature", e);
+        }
+    }
+
+    /**
+     * Returns a copy of this event stamped with an HMAC-SHA256 signature over currentHash.
+     */
+    public LivenessAuditEvent withSignature(String secretKey) {
+        String sig = computeHmacSignature(secretKey, this.currentHash);
+        return new LivenessAuditEvent(eventId, sessionId, timestampMillis, workflow,
+                eventType, decision, passiveScore, padClassification, padScore,
+                challengeType, errorCode, modelVersion, deviceId, details, previousHash, currentHash, sig);
     }
 
     public static class Builder {
@@ -107,6 +209,7 @@ public record LivenessAuditEvent(
         private String deviceId = "UNKNOWN_DEVICE";
         private Map<String, String> details = Collections.emptyMap();
         private String previousHash = "0000000000000000000000000000000000000000000000000000000000000000";
+        private String signature = null;
 
         public Builder eventId(String eventId) {
             this.eventId = eventId;
@@ -174,7 +277,7 @@ public record LivenessAuditEvent(
         }
 
         public Builder details(Map<String, String> details) {
-            this.details = details;
+            this.details = details != null ? details : Collections.emptyMap();
             return this;
         }
 
@@ -183,14 +286,20 @@ public record LivenessAuditEvent(
             return this;
         }
 
+        public Builder signature(String signature) {
+            this.signature = signature;
+            return this;
+        }
+
         public LivenessAuditEvent build() {
             String currentHash = computeHash(previousHash, eventId, sessionId, timestampMillis,
                     workflow, eventType, decision, passiveScore, padClassification, padScore,
-                    challengeType, errorCode, modelVersion, deviceId);
+                    challengeType, errorCode, modelVersion, deviceId, details);
 
             return new LivenessAuditEvent(eventId, sessionId, timestampMillis, workflow,
                     eventType, decision, passiveScore, padClassification, padScore,
-                    challengeType, errorCode, modelVersion, deviceId, details, previousHash, currentHash);
+                    challengeType, errorCode, modelVersion, deviceId, details, previousHash, currentHash, signature);
         }
     }
 }
+

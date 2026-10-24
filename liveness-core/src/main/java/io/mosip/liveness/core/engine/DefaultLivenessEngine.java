@@ -22,7 +22,9 @@ import io.mosip.liveness.api.quality.FaceQuality;
 import io.mosip.liveness.core.analyzer.ClientLandmarkAnalyzer;
 import io.mosip.liveness.core.analyzer.FaceAnalyzer;
 import io.mosip.liveness.core.analyzer.FaceObservation;
+import io.mosip.liveness.core.analyzer.LandmarkCrossValidator;
 import io.mosip.liveness.core.analyzer.OnnxFaceAnalyzer;
+import io.mosip.liveness.core.analyzer.ServerFaceDetector;
 import io.mosip.liveness.core.audit.AuditSink;
 import io.mosip.liveness.core.audit.InMemoryAuditSink;
 import io.mosip.liveness.core.challenge.ChallengeGenerator;
@@ -73,6 +75,7 @@ public class DefaultLivenessEngine implements LivenessEngine {
         PassiveLivenessResult latestPassiveResult = null;
         ChallengeVerifier currentVerifier = null;
         String auditTailHash = GENESIS_HASH;
+        String clientIdentity = null;
 
         FaceFrame bestCompliantFrame = null;
         double bestQualityScore = -1.0;
@@ -110,7 +113,9 @@ public class DefaultLivenessEngine implements LivenessEngine {
 
     private final Map<String, SessionContext> sessions = new ConcurrentHashMap<>();
     private final Map<String, Long> lockoutMap = new ConcurrentHashMap<>();
+    private final Map<String, Integer> failedSessionsMap = new ConcurrentHashMap<>();
     private long lockoutDurationMillis = 60_000L; // default 60s demo lockout
+    private String auditHmacSecretKey = null;
 
     public DefaultLivenessEngine() {
         this(new ClientLandmarkAnalyzer(), new PassiveAnalyzer(), new ChallengeGenerator(), new InMemoryAuditSink(), null);
@@ -130,6 +135,14 @@ public class DefaultLivenessEngine implements LivenessEngine {
 
     public void setLockoutDurationMillis(long millis) {
         this.lockoutDurationMillis = Math.max(1000L, millis);
+    }
+
+    public void setAuditHmacSecretKey(String key) {
+        this.auditHmacSecretKey = key;
+    }
+
+    public String getAuditHmacSecretKey() {
+        return auditHmacSecretKey;
     }
 
     public boolean isDeviceLockedOut(String deviceId) {
@@ -156,17 +169,37 @@ public class DefaultLivenessEngine implements LivenessEngine {
                                          WorkflowType workflow,
                                          LivenessPolicy policy,
                                          LivenessListener listener) {
+        return startSession(sessionId, workflow, policy, listener, null);
+    }
+
+    @Override
+    public LivenessSession startSession(String sessionId,
+                                         WorkflowType workflow,
+                                         LivenessPolicy policy,
+                                         LivenessListener listener,
+                                         String clientIdentity) {
         Objects.requireNonNull(sessionId, "sessionId cannot be null");
         Objects.requireNonNull(workflow, "workflow cannot be null");
         Objects.requireNonNull(policy, "policy cannot be null");
 
-        if (isDeviceLockedOut(sessionId)) {
+        String effectiveIdentity = (clientIdentity != null && !clientIdentity.isBlank()) ? clientIdentity : sessionId;
+
+        if (isDeviceLockedOut(effectiveIdentity)) {
             throw new LivenessException(LivenessError.MAX_RETRIES_EXCEEDED,
-                    "Session creation refused: workstation currently locked out due to attack detection.");
+                    "Session creation refused: client currently locked out due to attack detection.");
+        }
+
+        // P0-4: Check persisted retry budget / failed sessions across sockets
+        int failedCount = failedSessionsMap.getOrDefault(effectiveIdentity, 0);
+        if (failedCount >= policy.maxRetries()) {
+            lockoutMap.put(effectiveIdentity, System.currentTimeMillis() + lockoutDurationMillis);
+            throw new LivenessException(LivenessError.MAX_RETRIES_EXCEEDED,
+                    "Session creation refused: maximum retries exceeded for client " + effectiveIdentity);
         }
 
         LivenessSession session = new LivenessSession(sessionId, workflow, policy);
         SessionContext ctx = new SessionContext(session, listener);
+        ctx.clientIdentity = (clientIdentity != null && !clientIdentity.isBlank()) ? clientIdentity : null;
         sessions.put(sessionId, ctx);
 
         // Record SESSION_START audit event
@@ -206,24 +239,63 @@ public class DefaultLivenessEngine implements LivenessEngine {
             }
 
             // Check lockout
-            if (isDeviceLockedOut(frame.getDeviceId())) {
+            String effectiveClient = ctx.clientIdentity != null ? ctx.clientIdentity : frame.getDeviceId();
+            if (isDeviceLockedOut(effectiveClient)) {
                 return LivenessDecision.failedMaxRetries(session.getSessionId(), session.getWorkflow(),
                         "Device is temporarily locked out.");
             }
 
             // Check if session has already exceeded max retries
             if (session.getRetryCount() > session.getPolicy().maxRetries()) {
-                return handleExceededRetries(ctx, session, frame.getDeviceId());
+                return handleExceededRetries(ctx, session, effectiveClient);
             }
 
             // 2. Face Analysis & Landmark observation
-            Optional<FaceObservation> observationOpt = faceAnalyzer.analyze(session.getSessionId(), frame);
-            FaceObservation observation = observationOpt.orElse(FaceObservation.none());
+            Optional<FaceObservation> clientObsOpt = faceAnalyzer.analyze(session.getSessionId(), frame);
+            FaceObservation serverObs = ServerFaceDetector.detect(frame);
+
+            FaceObservation observation;
+            if (clientObsOpt.isPresent() && clientObsOpt.get().faceCount() > 0) {
+                FaceObservation clientObs = clientObsOpt.get();
+
+                // Cross-validate client landmarks vs server detection
+                io.mosip.liveness.core.analyzer.LandmarkCrossValidator.LandmarkValidationResult val =
+                        io.mosip.liveness.core.analyzer.LandmarkCrossValidator.validate(clientObs, serverObs);
+
+                if (!val.valid()) {
+                    recordAudit(ctx, AuditEventType.LANDMARK_MISMATCH, DecisionType.REJECTED,
+                            0.0, PadClassification.UNKNOWN_ATTACK, 1.0, null,
+                            LivenessError.PAD_FAILURE.getErrorCode(),
+                            Map.of("reason", val.reason(), "iou", String.format(java.util.Locale.ROOT, "%.3f", val.iou())));
+
+                    int retries = session.incrementRetry();
+                    if (retries > session.getPolicy().maxRetries()) {
+                        return handleExceededRetries(ctx, session, effectiveClient);
+                    }
+
+                    ctx.frameWindow.clear();
+                    ctx.state = EngineState.FACE_POSITIONING;
+                    ctx.consecutiveCompliantFrames = 0;
+
+                    String userMsg = LivenessError.PAD_FAILURE.getDefaultUserMessage()
+                            + " (attempt " + retries + " of " + (session.getPolicy().maxRetries() + 1) + ")";
+                    LivenessDecision decision = LivenessDecision.rejected(session.getSessionId(), session.getWorkflow(),
+                            userMsg, ctx.latestPassiveResult, ctx.completedChallenges);
+
+                    if (ctx.listener != null) {
+                        ctx.listener.onDecision(session, decision);
+                        ctx.listener.onPassiveProgress(session, 0, session.getPolicy().passiveWindowFrames());
+                        ctx.listener.onStateChanged(session, EngineState.FACE_POSITIONING.name(), userMsg);
+                    }
+                    return decision;
+                }
+                observation = clientObs;
+            } else {
+                observation = serverObs;
+            }
 
             // 3. ISO 19794-5 Quality gate evaluation
             FaceQuality quality = QualityEvaluator.evaluate(frame, observation);
-            recordAudit(ctx, AuditEventType.QUALITY_CHECK, null, null, null, null, null, null,
-                    Map.of("compliant", String.valueOf(quality.isCompliant())));
 
             // In ACTIVE_CHALLENGE, filter out the specific action requested by the active challenge
             java.util.Set<io.mosip.liveness.api.quality.QualityFailureReason> activeFailures =
@@ -260,6 +332,11 @@ public class DefaultLivenessEngine implements LivenessEngine {
                     ctx.consecutiveCompliantFrames++;
                     if (ctx.consecutiveCompliantFrames >= 3) {
                         ctx.state = EngineState.PASSIVE_CHECK;
+                        // Summarized quality check logged on state transition
+                        recordAudit(ctx, AuditEventType.QUALITY_CHECK, null, null, null, null, null, null,
+                                Map.of("compliant", "true",
+                                        "blur", String.format(java.util.Locale.ROOT, "%.1f", quality.blurScore()),
+                                        "luma", String.format(java.util.Locale.ROOT, "%.2f", quality.brightnessScore())));
                         if (ctx.listener != null) {
                             ctx.listener.onStateChanged(session, EngineState.PASSIVE_CHECK.name(), "Hold still, checking liveness...");
                         }
@@ -295,7 +372,7 @@ public class DefaultLivenessEngine implements LivenessEngine {
 
                         int retries = session.incrementRetry();
                         if (retries > session.getPolicy().maxRetries()) {
-                            return handleExceededRetries(ctx, session, frame.getDeviceId());
+                            return handleExceededRetries(ctx, session, effectiveClient);
                         }
 
                         // Clear window for retry
@@ -304,8 +381,17 @@ public class DefaultLivenessEngine implements LivenessEngine {
                         ctx.consecutiveCompliantFrames = 0;
 
                         // Anti-adversarial user feedback rule: NEVER disclose attack type to user
-                        return LivenessDecision.rejected(session.getSessionId(), session.getWorkflow(),
-                                LivenessError.PAD_FAILURE.getDefaultUserMessage(), passiveResult, ctx.completedChallenges);
+                        String userMsg = LivenessError.PAD_FAILURE.getDefaultUserMessage()
+                                + " (attempt " + retries + " of " + (session.getPolicy().maxRetries() + 1) + ")";
+                        LivenessDecision decision = LivenessDecision.rejected(session.getSessionId(), session.getWorkflow(),
+                                userMsg, passiveResult, ctx.completedChallenges);
+
+                        if (ctx.listener != null) {
+                            ctx.listener.onDecision(session, decision);
+                            ctx.listener.onPassiveProgress(session, 0, session.getPolicy().passiveWindowFrames());
+                            ctx.listener.onStateChanged(session, EngineState.FACE_POSITIONING.name(), userMsg);
+                        }
+                        return decision;
                     }
 
                     // Not an attack: check if passive score satisfies threshold without active challenge
@@ -330,13 +416,22 @@ public class DefaultLivenessEngine implements LivenessEngine {
                     if (!session.getPolicy().activeEnabled() || session.getPolicy().minChallenges() <= 0) {
                         int retries = session.incrementRetry();
                         if (retries > session.getPolicy().maxRetries()) {
-                            return handleExceededRetries(ctx, session, frame.getDeviceId());
+                            return handleExceededRetries(ctx, session, effectiveClient);
                         }
                         ctx.frameWindow.clear();
                         ctx.state = EngineState.FACE_POSITIONING;
                         ctx.consecutiveCompliantFrames = 0;
-                        return LivenessDecision.retry(session.getSessionId(), session.getWorkflow(),
-                                "Please keep your face clearly visible and look naturally at the camera", passiveResult);
+                        String retryMsg = "Please keep your face clearly visible and look naturally at the camera"
+                                + " (attempt " + retries + " of " + (session.getPolicy().maxRetries() + 1) + ")";
+                        LivenessDecision decision = LivenessDecision.retry(session.getSessionId(), session.getWorkflow(),
+                                retryMsg, passiveResult);
+
+                        if (ctx.listener != null) {
+                            ctx.listener.onDecision(session, decision);
+                            ctx.listener.onPassiveProgress(session, 0, session.getPolicy().passiveWindowFrames());
+                            ctx.listener.onStateChanged(session, EngineState.FACE_POSITIONING.name(), retryMsg);
+                        }
+                        return decision;
                     }
 
                     // Inconclusive or active challenges mandatory -> transition to ACTIVE_CHALLENGE
@@ -368,7 +463,8 @@ public class DefaultLivenessEngine implements LivenessEngine {
                                 ctx.latestPassiveResult, ch.promptText());
                     }
 
-                    Optional<ChallengeResult> challengeResultOpt = ctx.currentVerifier.update(observation.landmarks(), arrivalNanos);
+                    // Challenge verification with server pixel corroboration
+                    Optional<ChallengeResult> challengeResultOpt = ctx.currentVerifier.update(observation.landmarks(), arrivalNanos, frame);
                     if (challengeResultOpt.isEmpty()) {
                         // In progress
                         return LivenessDecision.challengeRequired(session.getSessionId(), session.getWorkflow(),
@@ -422,7 +518,7 @@ public class DefaultLivenessEngine implements LivenessEngine {
                         // Challenge failed or timed out
                         int retries = session.incrementRetry();
                         if (retries > session.getPolicy().maxRetries()) {
-                            return handleExceededRetries(ctx, session, frame.getDeviceId());
+                            return handleExceededRetries(ctx, session, effectiveClient);
                         }
 
                         // Try fresh challenge
@@ -430,13 +526,20 @@ public class DefaultLivenessEngine implements LivenessEngine {
                         session.setCurrentChallenge(fresh);
                         ctx.currentVerifier = new ChallengeVerifier(fresh, observation.landmarks());
 
+                        recordAudit(ctx, AuditEventType.CHALLENGE_ISSUED, null, null, null, null,
+                                fresh.type(), null, Map.of("challengeId", fresh.challengeId()));
+
+                        String retryMsg = fresh.promptText() + " (attempt " + retries + " of " + (session.getPolicy().maxRetries() + 1) + ")";
+                        LivenessDecision decision = LivenessDecision.retry(session.getSessionId(), session.getWorkflow(),
+                                retryMsg, ctx.latestPassiveResult);
+
                         if (ctx.listener != null) {
+                            ctx.listener.onDecision(session, decision);
                             ctx.listener.onChallengeIssued(session, fresh);
                             ctx.listener.onStateChanged(session, EngineState.ACTIVE_CHALLENGE.name(), fresh.promptText());
                         }
 
-                        return LivenessDecision.retry(session.getSessionId(), session.getWorkflow(),
-                                fresh.promptText(), ctx.latestPassiveResult);
+                        return decision;
                     }
                 }
 
@@ -464,12 +567,26 @@ public class DefaultLivenessEngine implements LivenessEngine {
         ctx.state = EngineState.DECIDED;
         FailureBehaviour behaviour = session.getPolicy().failureBehaviour();
 
-        if (behaviour == FailureBehaviour.LOCKOUT) {
-            lockoutMap.put(deviceId != null ? deviceId : session.getSessionId(),
-                    System.currentTimeMillis() + lockoutDurationMillis);
-            log.warn("Device/session [{}] locked out for {} seconds due to max retries.",
-                    deviceId, lockoutDurationMillis / 1000);
+        long expiry = System.currentTimeMillis() + lockoutDurationMillis;
+        if (deviceId != null && !deviceId.isBlank()) {
+            failedSessionsMap.merge(deviceId, 1, Integer::sum);
+            if (behaviour == FailureBehaviour.LOCKOUT || failedSessionsMap.getOrDefault(deviceId, 0) >= session.getPolicy().maxRetries()) {
+                lockoutMap.put(deviceId, expiry);
+                log.warn("Device [{}] locked out for {} seconds due to max retries.",
+                        deviceId, lockoutDurationMillis / 1000);
+            }
         }
+
+        if (ctx.clientIdentity != null && !ctx.clientIdentity.isBlank() && !ctx.clientIdentity.equals(deviceId)) {
+            failedSessionsMap.merge(ctx.clientIdentity, 1, Integer::sum);
+            if (behaviour == FailureBehaviour.LOCKOUT || failedSessionsMap.getOrDefault(ctx.clientIdentity, 0) >= session.getPolicy().maxRetries()) {
+                lockoutMap.put(ctx.clientIdentity, expiry);
+                log.warn("Client [{}] locked out for {} seconds due to max retries.",
+                        ctx.clientIdentity, lockoutDurationMillis / 1000);
+            }
+        }
+
+        lockoutMap.put(session.getSessionId(), expiry);
 
         recordAudit(ctx, AuditEventType.FINAL_DECISION, DecisionType.FAILED_MAX_RETRIES,
                 ctx.latestPassiveResult != null ? ctx.latestPassiveResult.livenessScore() : 0.0,
@@ -493,7 +610,7 @@ public class DefaultLivenessEngine implements LivenessEngine {
                              ChallengeType challengeType,
                              String errorCode,
                              Map<String, String> details) {
-        LivenessAuditEvent event = LivenessAuditEvent.builder()
+        LivenessAuditEvent.Builder b = LivenessAuditEvent.builder()
                 .sessionId(ctx.session.getSessionId())
                 .workflow(ctx.session.getWorkflow())
                 .eventType(eventType)
@@ -504,10 +621,15 @@ public class DefaultLivenessEngine implements LivenessEngine {
                 .challengeType(challengeType)
                 .errorCode(errorCode)
                 .modelVersion(getEngineVersion())
-                .deviceId(ctx.session.getSessionId())
+                .deviceId(ctx.clientIdentity != null ? ctx.clientIdentity : ctx.session.getSessionId())
                 .details(details)
-                .previousHash(ctx.auditTailHash)
-                .build();
+                .previousHash(ctx.auditTailHash);
+
+        LivenessAuditEvent event = b.build();
+        if ((eventType == AuditEventType.FINAL_DECISION || eventType == AuditEventType.SUPERVISOR_OVERRIDE)
+                && auditHmacSecretKey != null && !auditHmacSecretKey.isBlank()) {
+            event = event.withSignature(auditHmacSecretKey);
+        }
 
         ctx.auditTailHash = event.currentHash();
         auditSink.append(event);
@@ -566,9 +688,14 @@ public class DefaultLivenessEngine implements LivenessEngine {
                 .details(Map.of("supervisorSessionId", supervisorSessionId != null ? supervisorSessionId : "unknown"))
                 .build();
 
+        if (auditHmacSecretKey != null && !auditHmacSecretKey.isBlank()) {
+            overrideEvent = overrideEvent.withSignature(auditHmacSecretKey);
+        }
+
         auditSink.append(overrideEvent);
         return true;
     }
+
 
     @Override
     public void close() {

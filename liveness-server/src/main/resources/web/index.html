@@ -42,6 +42,10 @@
           </button>
         </div>
 
+        <div class="control-group">
+          <button id="btnJudgeMode" class="btn btn-sm btn-secondary" title="Unlock Judge Mode (token-gated)">⚖️ Judge Mode</button>
+        </div>
+
         <div class="status-indicator" id="serverStatusIndicator" title="Server Connection">
           <span class="status-dot"></span>
           <span class="status-label" id="serverStatusLabel">Connecting...</span>
@@ -99,11 +103,11 @@
                 <h2 class="decision-title" id="decisionTitle">Verification Successful</h2>
                 <p class="decision-message" id="decisionMessage">Face verification completed.</p>
                 <div class="decision-stats" id="decisionStats">
-                  <div class="stat-item">
+                  <div class="stat-item" id="decisionScoreRow">
                     <span class="stat-label">Score</span>
-                    <span class="stat-value" id="decisionScore">0.96</span>
+                    <span class="stat-value" id="decisionScore">-</span>
                   </div>
-                  <div class="stat-item">
+                  <div class="stat-item" id="decisionSessionIdRow">
                     <span class="stat-label">Session ID</span>
                     <span class="stat-value code-font" id="decisionSessionId">-</span>
                   </div>

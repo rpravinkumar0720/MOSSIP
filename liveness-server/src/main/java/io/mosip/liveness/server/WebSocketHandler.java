@@ -8,11 +8,8 @@ import io.javalin.websocket.WsErrorContext;
 import io.javalin.websocket.WsMessageContext;
 import io.mosip.liveness.api.challenge.Challenge;
 import io.mosip.liveness.api.challenge.ChallengeResult;
-import io.mosip.liveness.api.classifier.PadResult;
-import io.mosip.liveness.api.classifier.PassiveLivenessResult;
 import io.mosip.liveness.api.decision.DecisionType;
 import io.mosip.liveness.api.decision.LivenessDecision;
-import io.mosip.liveness.api.engine.LivenessEngine;
 import io.mosip.liveness.api.engine.LivenessListener;
 import io.mosip.liveness.api.engine.LivenessSession;
 import io.mosip.liveness.api.error.LivenessError;
@@ -20,28 +17,31 @@ import io.mosip.liveness.api.frame.FaceFrame;
 import io.mosip.liveness.api.frame.PixelFormat;
 import io.mosip.liveness.api.policy.LivenessPolicy;
 import io.mosip.liveness.api.policy.WorkflowType;
-import io.mosip.liveness.api.quality.BoundingBox;
-import io.mosip.liveness.api.quality.FaceLandmarks;
 import io.mosip.liveness.api.quality.FaceQuality;
 import io.mosip.liveness.api.quality.Point2D;
 import io.mosip.liveness.api.quality.QualityFailureReason;
 import io.mosip.liveness.core.analyzer.ClientLandmarkAnalyzer;
-import io.mosip.liveness.core.analyzer.FaceObservation;
-import io.mosip.liveness.core.analyzer.LandmarkGeometry;
 import io.mosip.liveness.core.engine.DefaultLivenessEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
+import javax.imageio.stream.ImageInputStream;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Handles WebSocket sessions for real-time video frame streaming and liveness detection.
@@ -58,11 +58,14 @@ public class WebSocketHandler {
 
     private final DefaultLivenessEngine engine;
     private final ServerConfig config;
+    private final SessionTokenService tokenService;
     private final Map<String, SocketSessionState> sessions = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> ipConnections = new ConcurrentHashMap<>();
 
     public WebSocketHandler(DefaultLivenessEngine engine, ServerConfig config) {
         this.engine = engine;
         this.config = config;
+        this.tokenService = new SessionTokenService(config.sessionSecret());
     }
 
     public int getActiveSessionCount() {
@@ -73,40 +76,102 @@ public class WebSocketHandler {
         final WsConnectContext ws;
         final String lang;
         final WorkflowType workflow;
+        final String clientIdentity;
+        final String deviceId;
+        final boolean judgeMode;
+        final String clientIp;
         LivenessSession session;
         long lastFrameNanos = 0L;
         long lastActivityMillis = System.currentTimeMillis();
+        long totalBytesReceived = 0L;
 
-        SocketSessionState(WsConnectContext ws, String lang, WorkflowType workflow) {
+        SocketSessionState(WsConnectContext ws, String lang, WorkflowType workflow,
+                           String clientIdentity, String deviceId, boolean judgeMode, String clientIp) {
             this.ws = ws;
             this.lang = lang != null ? lang : "en";
             this.workflow = workflow != null ? workflow : WorkflowType.RESIDENT_AUTH;
+            this.clientIdentity = clientIdentity;
+            this.deviceId = deviceId;
+            this.judgeMode = judgeMode;
+            this.clientIp = clientIp;
         }
     }
 
     public void onConnect(WsConnectContext ctx) {
-        String workflowParam = ctx.queryParam("workflow");
-        String lang = ctx.queryParam("lang");
+        String clientIp = resolveClientIp(ctx);
 
-        WorkflowType workflow = WorkflowType.RESIDENT_AUTH;
-        if (workflowParam != null) {
-            try {
-                workflow = WorkflowType.valueOf(workflowParam.trim().toUpperCase());
-            } catch (IllegalArgumentException ignored) {
-            }
+        // 1. Check Origin allow-list
+        String origin = ctx.header("Origin");
+        if (!isOriginAllowed(origin, config.allowedOrigins())) {
+            log.warn("WebSocket rejected: Forbidden Origin [{}] from IP {}", origin, clientIp);
+            ctx.closeSession(1008, "Origin not allowed");
+            return;
         }
 
-        SocketSessionState state = new SocketSessionState(ctx, lang, workflow);
+        // 2. Check per-IP connection cap
+        int count = ipConnections.computeIfAbsent(clientIp, k -> new AtomicInteger(0)).incrementAndGet();
+        if (count > config.maxConnectionsPerIp()) {
+            ipConnections.get(clientIp).decrementAndGet();
+            log.warn("WebSocket rejected: Per-IP connection cap exceeded for IP {}", clientIp);
+            ctx.closeSession(1008, "Too many connections from IP");
+            return;
+        }
+
+        // 3. Authenticate session token / demo fallback
+        String tokenParam = ctx.queryParam("token");
+        SessionTokenService.SessionToken verifiedToken = tokenService.verifyToken(tokenParam);
+
+        String sessionId;
+        WorkflowType workflow;
+        String clientIdentity;
+
+        if (verifiedToken.valid()) {
+            sessionId = verifiedToken.sessionId();
+            workflow = verifiedToken.workflow();
+            clientIdentity = verifiedToken.clientIdentity();
+        } else if (config.demoMode()) {
+            // Demo mode fallback: allow unauthenticated connects with query params
+            sessionId = java.util.UUID.randomUUID().toString();
+            String workflowParam = ctx.queryParam("workflow");
+            workflow = WorkflowType.RESIDENT_AUTH;
+            if (workflowParam != null) {
+                try {
+                    workflow = WorkflowType.valueOf(workflowParam.trim().toUpperCase());
+                } catch (IllegalArgumentException ignored) {}
+            }
+            clientIdentity = clientIp;
+        } else {
+            ipConnections.get(clientIp).decrementAndGet();
+            log.warn("WebSocket rejected: Missing or invalid session token from IP {}", clientIp);
+            ctx.closeSession(1008, "Valid session token required. Request via POST /api/v1/sessions");
+            return;
+        }
+
+        String lang = ctx.queryParam("lang");
+        String adminTokenParam = ctx.queryParam("adminToken");
+        boolean judgeMode = config.diagnosticMode() || constantTimeEquals(adminTokenParam, config.adminToken());
+
+        String deviceId = ctx.queryParam("deviceId");
+        if (deviceId == null || deviceId.isBlank()) {
+            deviceId = clientIdentity;
+        }
+
+        SocketSessionState state = new SocketSessionState(ctx, lang, workflow, clientIdentity, deviceId, judgeMode, clientIp);
         LivenessPolicy policy = resolvePolicy(workflow, config.demoMode());
 
         LivenessListener listener = createListener(state);
-        String sessionId = java.util.UUID.randomUUID().toString();
-        LivenessSession session = engine.startSession(sessionId, workflow, policy, listener);
-        state.session = session;
-        sessions.put(ctx.sessionId(), state);
+        try {
+            LivenessSession session = engine.startSession(sessionId, workflow, policy, listener, clientIdentity);
+            state.session = session;
+            sessions.put(ctx.sessionId(), state);
 
-        log.info("WebSocket connected: socketId={}, livenessSessionId={}, workflow={}, lang={}",
-                ctx.sessionId(), session.getSessionId(), workflow, lang);
+            log.info("WebSocket connected: socketId={}, livenessSessionId={}, workflow={}, clientIdentity={}, judgeMode={}",
+                    ctx.sessionId(), session.getSessionId(), workflow, clientIdentity, judgeMode);
+        } catch (Exception e) {
+            ipConnections.get(clientIp).decrementAndGet();
+            log.warn("Refused session start for {}: {}", clientIdentity, e.getMessage());
+            ctx.closeSession(1008, e.getMessage());
+        }
     }
 
     public void onMessage(WsMessageContext ctx) {
@@ -162,6 +227,20 @@ public class WebSocketHandler {
         }
 
         byte[] jpegBytes = Base64.getDecoder().decode(b64);
+
+        // Session byte cap check
+        state.totalBytesReceived += jpegBytes.length;
+        if (state.totalBytesReceived > config.maxSessionBytes()) {
+            log.warn("Session {} exceeded byte quota ({} bytes)", state.session.getSessionId(), state.totalBytesReceived);
+            sendJson(state.ws, Map.of(
+                    "type", "error",
+                    "code", LivenessError.INVALID_FRAME_DATA.getErrorCode(),
+                    "message", "Session byte cap exceeded."
+            ));
+            state.ws.closeSession(1008, "Byte cap exceeded");
+            return;
+        }
+
         if (jpegBytes.length > MAX_FRAME_BYTES) {
             sendJson(state.ws, Map.of(
                     "type", "error",
@@ -171,19 +250,33 @@ public class WebSocketHandler {
             return;
         }
 
-        BufferedImage img = ImageIO.read(new ByteArrayInputStream(jpegBytes));
-        if (img == null) {
-            return;
+        // P3-6: Inspect dimensions before full decompression to mitigate decompression bomb
+        int w = 0;
+        int h = 0;
+        Iterator<ImageReader> readers = ImageIO.getImageReadersByFormatName("jpeg");
+        if (readers.hasNext()) {
+            ImageReader reader = readers.next();
+            try (ImageInputStream iis = ImageIO.createImageInputStream(new ByteArrayInputStream(jpegBytes))) {
+                reader.setInput(iis, true);
+                w = reader.getWidth(0);
+                h = reader.getHeight(0);
+            } catch (Exception ignored) {
+            } finally {
+                reader.dispose();
+            }
         }
 
-        int w = img.getWidth();
-        int h = img.getHeight();
         if (w > MAX_DIMENSION || h > MAX_DIMENSION || w <= 0 || h <= 0) {
             sendJson(state.ws, Map.of(
                     "type", "error",
                     "code", LivenessError.INVALID_FRAME_DATA.getErrorCode(),
                     "message", "Frame dimensions out of bounds"
             ));
+            return;
+        }
+
+        BufferedImage img = ImageIO.read(new ByteArrayInputStream(jpegBytes));
+        if (img == null) {
             return;
         }
 
@@ -197,7 +290,6 @@ public class WebSocketHandler {
             rgbBytes[i * 3 + 2] = (byte) (p & 0xFF);
         }
 
-        long clientTsMs = root.path("tsMs").asLong(System.currentTimeMillis());
         long seq = root.path("seq").asLong(0L);
 
         // Parse landmarks if provided
@@ -215,21 +307,22 @@ public class WebSocketHandler {
                 PixelFormat.RGB_888,
                 nowNanos,
                 seq,
-                state.session.getSessionId(),
+                state.deviceId,
                 0
         );
 
         try {
-            LivenessDecision decision = engine.processFrame(state.session, frame);
-
-            // If diagnostic mode is enabled, send diagnostic telemetry
-            if (config.diagnosticMode()) {
+            engine.processFrame(state.session, frame);
+            if (config.diagnosticMode() || state.judgeMode) {
                 sendDiagnosticIfAvailable(state);
             }
         } finally {
             if (!frame.isWiped()) {
                 frame.wipe();
             }
+            // P3-6: Zero intermediate volatile buffers
+            Arrays.fill(pixels, 0);
+            Arrays.fill(jpegBytes, (byte) 0);
         }
     }
 
@@ -241,33 +334,48 @@ public class WebSocketHandler {
             if (pt.isArray() && pt.size() >= 2) {
                 x = pt.get(0).asDouble();
                 y = pt.get(1).asDouble();
-            } else if (pt.isObject()) {
-                x = pt.path("x").asDouble();
-                y = pt.path("y").asDouble();
+            } else if (pt.isObject() && pt.has("x") && pt.has("y")) {
+                x = pt.get("x").asDouble();
+                y = pt.get("y").asDouble();
             } else {
                 continue;
             }
-            if (Double.isFinite(x) && Double.isFinite(y)) {
-                result.add(new Point2D((float) Math.max(0.0, Math.min(1.0, x)), (float) Math.max(0.0, Math.min(1.0, y))));
-            }
+            result.add(Point2D.of((float) x, (float) y));
         }
         return result;
     }
 
     private void sendDiagnosticIfAvailable(SocketSessionState state) {
-        if (state.session == null) return;
         Map<String, Object> diag = new LinkedHashMap<>();
         diag.put("type", "diagnostic");
         diag.put("sessionId", state.session.getSessionId());
-        diag.put("engineVersion", engine.getEngineVersion());
-        diag.put("weights", engine.getPassiveAnalyzer().getWeights().asMap());
+        diag.put("workflow", state.workflow.name());
+        diag.put("retryCount", state.session.getRetryCount());
+        diag.put("activeChallenge", state.session.getCurrentChallenge() != null ? state.session.getCurrentChallenge().type().name() : null);
+
+        Map<String, Object> weights = new LinkedHashMap<>();
+        weights.put("microMotion", 0.15);
+        weights.put("texture", 0.20);
+        weights.put("specular", 0.15);
+        weights.put("moire", 0.15);
+        weights.put("colorDistribution", 0.15);
+        weights.put("borderAnomaly", 0.10);
+        weights.put("timingJitter", 0.10);
+        diag.put("weights", weights);
+
         sendJson(state.ws, diag);
     }
 
     public void onClose(WsCloseContext ctx) {
         SocketSessionState state = sessions.remove(ctx.sessionId());
-        if (state != null && state.session != null && !state.session.isClosed()) {
-            engine.cancelSession(state.session);
+        if (state != null) {
+            AtomicInteger count = ipConnections.get(state.clientIp);
+            if (count != null) {
+                count.decrementAndGet();
+            }
+            if (state.session != null && !state.session.isClosed()) {
+                engine.cancelSession(state.session);
+            }
         }
         log.info("WebSocket closed: socketId={}", ctx.sessionId());
     }
@@ -337,7 +445,7 @@ public class WebSocketHandler {
 
             @Override
             public void onDecision(LivenessSession session, LivenessDecision decision) {
-                // Rule 6.5: For ANY PAD attack, force generic message!
+                // Rule P0-2: Public WS payload = decision enum + generic message only. No score, no PAD info.
                 String userMsg;
                 if (decision.decisionType() == DecisionType.REJECTED) {
                     userMsg = LocalizationService.translate("DECISION_REJECTED",
@@ -356,8 +464,12 @@ public class WebSocketHandler {
                 resp.put("type", "decision");
                 resp.put("decision", decision.decisionType().name());
                 resp.put("userMessage", userMsg);
-                resp.put("score", decision.finalScore());
-                resp.put("sessionId", session.getSessionId());
+
+                // Anti-adversarial security gate: only judge mode unlocks internal metrics
+                if (state.judgeMode) {
+                    resp.put("score", decision.finalScore());
+                    resp.put("sessionId", session.getSessionId());
+                }
 
                 sendJson(state.ws, resp);
             }
@@ -383,6 +495,33 @@ public class WebSocketHandler {
         }
     }
 
+    private static String resolveClientIp(WsConnectContext ctx) {
+        String xff = ctx.header("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            return xff.split(",")[0].trim();
+        }
+        return (ctx.session != null && ctx.session.getRemoteAddress() != null)
+                ? ctx.session.getRemoteAddress().toString()
+                : "127.0.0.1";
+    }
+
+    private static boolean isOriginAllowed(String origin, List<String> allowedOrigins) {
+        if (origin == null || origin.isBlank()) return true;
+        if (allowedOrigins == null || allowedOrigins.isEmpty() || allowedOrigins.contains("*")) return true;
+        for (String allowed : allowedOrigins) {
+            if (origin.equalsIgnoreCase(allowed) || allowed.equals("*")) return true;
+        }
+        return false;
+    }
+
+    private static boolean constantTimeEquals(String a, String b) {
+        if (a == null || b == null) return false;
+        return MessageDigest.isEqual(
+                a.getBytes(StandardCharsets.UTF_8),
+                b.getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
     private static LivenessPolicy resolvePolicy(WorkflowType workflow, boolean demoMode) {
         LivenessPolicy base = switch (workflow) {
             case RESIDENT_ENROLLMENT -> LivenessPolicy.residentEnrollment();
@@ -392,7 +531,6 @@ public class WebSocketHandler {
         };
 
         if (demoMode) {
-            // Relax timeout slightly in demo mode (e.g. 6 seconds instead of 4)
             return LivenessPolicy.builder()
                     .passiveThreshold(base.passiveThreshold())
                     .padThreshold(base.padThreshold())

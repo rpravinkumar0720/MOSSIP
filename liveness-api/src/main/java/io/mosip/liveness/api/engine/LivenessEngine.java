@@ -18,12 +18,22 @@ public interface LivenessEngine extends AutoCloseable {
      * @param workflow MOSIP workflow (Resident, Operator, Supervisor)
      * @param policy workflow-specific policy configuration
      * @param listener event listener for UI callbacks and state changes
-     * @return initialized LivenessSession handle
      */
     LivenessSession startSession(String sessionId,
                                  WorkflowType workflow,
                                  LivenessPolicy policy,
                                  LivenessListener listener);
+
+    /**
+     * Initializes a new biometric liveness session bound to an authenticated client identity / device ID.
+     */
+    default LivenessSession startSession(String sessionId,
+                                         WorkflowType workflow,
+                                         LivenessPolicy policy,
+                                         LivenessListener listener,
+                                         String clientIdentity) {
+        return startSession(sessionId, workflow, policy, listener);
+    }
 
     /**
      * Ingests and processes a single frame from the biometric device stream.

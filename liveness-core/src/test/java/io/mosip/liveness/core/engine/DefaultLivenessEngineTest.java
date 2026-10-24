@@ -36,9 +36,10 @@ class DefaultLivenessEngineTest {
                 double dist = Math.sqrt(dx * dx + dy * dy);
                 int shading = (int) (35 * (1.0 - Math.min(1.0, dist)));
                 int checker = ((x % 2 == 0) ^ (y % 2 == 0)) ? 25 : -25;
-                int r = Math.min(240, Math.max(10, 165 + shading + checker));
-                int g = Math.min(200, Math.max(10, 115 + shading + checker));
-                int b = Math.min(170, Math.max(10, 85 + (shading / 2) + checker));
+                int noise = ((seed * 17 + x * 7 + y * 13) % 15) - 7;
+                int r = Math.min(240, Math.max(10, 165 + shading + checker + noise));
+                int g = Math.min(200, Math.max(10, 115 + shading + checker + noise));
+                int b = Math.min(170, Math.max(10, 85 + (shading / 2) + checker + noise));
                 int idx = (y * width + x) * 3;
                 data[idx] = (byte) r;
                 data[idx + 1] = (byte) g;

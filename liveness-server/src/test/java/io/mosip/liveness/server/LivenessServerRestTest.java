@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class LivenessServerRestTest {
 
     private static final ObjectMapper mapper = new ObjectMapper();
+    private static final String ADMIN_TOKEN = "mosip-admin-token-2026";
     private LivenessServerApp serverApp;
     private Javalin app;
     private int port;
@@ -31,7 +32,8 @@ class LivenessServerRestTest {
 
     @BeforeEach
     void setUp() {
-        ServerConfig config = new ServerConfig(0, true, null, null, 30, true);
+        ServerConfig config = new ServerConfig(0, true, null, null, 30, false,
+                ADMIN_TOKEN, "secret-key-123", List.of("*"), 10, 15 * 1024 * 1024L);
         serverApp = new LivenessServerApp(config);
         app = serverApp.createApp();
         app.start(0);
@@ -48,7 +50,7 @@ class LivenessServerRestTest {
     }
 
     @Test
-    @DisplayName("GET /api/health returns UP and version details")
+    @DisplayName("GET /api/health returns UP, version details and multi-session integrity")
     void healthEndpoint() throws Exception {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/api/health"))
@@ -62,13 +64,77 @@ class LivenessServerRestTest {
         assertThat(json.path("status").asText()).isEqualTo("UP");
         assertThat(json.path("engineVersion").asText()).contains("mosip-liveness-core");
         assertThat(json.path("mode").asText()).isEqualTo("diagnostic");
+        assertThat(json.path("auditChainIntegrity").asBoolean()).isTrue();
     }
 
     @Test
-    @DisplayName("GET /api/policy/{workflow} returns effective parameters")
-    void policyEndpoint() throws Exception {
+    @DisplayName("P0-2: Unauthenticated GET /api/audit* and /api/policy* return 401")
+    void unauthenticatedAuditAndPolicyReturn401() throws Exception {
+        // Audit root
+        HttpRequest req1 = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/audit"))
+                .GET()
+                .build();
+        assertThat(client.send(req1, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+
+        // Audit by session
+        HttpRequest req2 = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/audit/session-xyz"))
+                .GET()
+                .build();
+        assertThat(client.send(req2, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+
+        // Policy root
+        HttpRequest req3 = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/policy"))
+                .GET()
+                .build();
+        assertThat(client.send(req3, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+
+        // Policy by workflow
+        HttpRequest req4 = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/policy/RESIDENT_AUTH"))
+                .GET()
+                .build();
+        assertThat(client.send(req4, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+    }
+
+    @Test
+    @DisplayName("P0-3: POST /api/v1/sessions issues a signed session token bound to workflow")
+    void sessionIssuanceEndpoint() throws Exception {
+        String body = mapper.writeValueAsString(Map.of(
+                "workflow", "RESIDENT_ENROLLMENT",
+                "clientIdentity", "client-device-42"
+        ));
+
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/v1/sessions"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build();
+
+        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+        assertThat(resp.statusCode()).isEqualTo(200);
+
+        JsonNode json = mapper.readTree(resp.body());
+        assertThat(json.path("sessionId").asText()).isNotBlank();
+        String token = json.path("token").asText();
+        assertThat(token).isNotBlank();
+        assertThat(json.path("workflow").asText()).isEqualTo("RESIDENT_ENROLLMENT");
+
+        // Verify that token service verifies this token
+        SessionTokenService.SessionToken verified = serverApp.getTokenService().verifyToken(token);
+        assertThat(verified.valid()).isTrue();
+        assertThat(verified.workflow()).isEqualTo(WorkflowType.RESIDENT_ENROLLMENT);
+        assertThat(verified.clientIdentity()).isEqualTo("client-device-42");
+    }
+
+    @Test
+    @DisplayName("GET /api/policy/{workflow} with admin token returns effective policy parameters")
+    void policyEndpointWithAuth() throws Exception {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/api/policy/RESIDENT_AUTH"))
+                .header("Authorization", "Bearer " + ADMIN_TOKEN)
                 .GET()
                 .build();
 
@@ -82,8 +148,8 @@ class LivenessServerRestTest {
     }
 
     @Test
-    @DisplayName("POST /api/audit/verify correctly validates chain integrity")
-    void auditVerifyEndpoint() throws Exception {
+    @DisplayName("POST /api/audit/verify with admin token validates chain integrity and detects tamper")
+    void auditVerifyEndpointWithAuth() throws Exception {
         String session = "test-session-123";
         LivenessAuditEvent ev1 = LivenessAuditEvent.builder()
                 .sessionId(session)
@@ -107,6 +173,7 @@ class LivenessServerRestTest {
         HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/api/audit/verify"))
                 .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + ADMIN_TOKEN)
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build();
 
@@ -124,7 +191,7 @@ class LivenessServerRestTest {
                 ev2.timestampMillis(),
                 ev2.workflow(),
                 ev2.eventType(),
-                DecisionType.REJECTED, // Tampered!
+                DecisionType.REJECTED, // Tampered decision
                 ev2.passiveScore(),
                 ev2.padClassification(),
                 ev2.padScore(),
@@ -134,13 +201,15 @@ class LivenessServerRestTest {
                 ev2.deviceId(),
                 ev2.details(),
                 ev2.previousHash(),
-                ev2.currentHash()
+                ev2.currentHash(),
+                null
         );
 
         String tamperedBody = mapper.writeValueAsString(List.of(ev1, tampered));
         HttpRequest req2 = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/api/audit/verify"))
                 .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + ADMIN_TOKEN)
                 .POST(HttpRequest.BodyPublishers.ofString(tamperedBody))
                 .build();
 
@@ -152,62 +221,93 @@ class LivenessServerRestTest {
     }
 
     @Test
-    @DisplayName("POST /api/supervisor/override records override audit event in demo mode")
-    void supervisorOverrideEndpoint() throws Exception {
-        Map<String, String> payload = Map.of(
-                "targetSessionId", "locked-session-456",
-                "supervisorSessionId", "sup-789"
-        );
-
-        HttpRequest req = HttpRequest.newBuilder()
+    @DisplayName("P0-3: POST /api/supervisor/override validates every rejection path and succeeds on valid auth")
+    void supervisorOverrideRejectionPaths() throws Exception {
+        // 1. Missing admin token -> 401
+        HttpRequest unauthReq = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + port + "/api/supervisor/override"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload)))
+                .POST(HttpRequest.BodyPublishers.ofString("{}"))
                 .build();
+        assertThat(client.send(unauthReq, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(401);
 
-        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-        assertThat(resp.statusCode()).isEqualTo(200);
-
-        JsonNode json = mapper.readTree(resp.body());
-        assertThat(json.path("success").asBoolean()).isTrue();
-
-        // Check that override event is stored in audit sink
-        List<LivenessAuditEvent> events = serverApp.getMemoryAuditSink().getEventsForSession("locked-session-456");
-        assertThat(events).hasSize(1);
-        assertThat(events.get(0).eventType()).isEqualTo(AuditEventType.SUPERVISOR_OVERRIDE);
-    }
-
-    @Test
-    @DisplayName("GET /api/policy returns all workflow policies")
-    void allPoliciesEndpoint() throws Exception {
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + port + "/api/policy"))
-                .GET()
+        // 2. Same target and supervisor session -> 400
+        String samePayload = mapper.writeValueAsString(Map.of(
+                "targetSessionId", "session-A",
+                "supervisorSessionId", "session-A"
+        ));
+        HttpRequest sameReq = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/supervisor/override"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + ADMIN_TOKEN)
+                .POST(HttpRequest.BodyPublishers.ofString(samePayload))
                 .build();
+        assertThat(client.send(sameReq, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(400);
 
-        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-        assertThat(resp.statusCode()).isEqualTo(200);
-
-        JsonNode json = mapper.readTree(resp.body());
-        assertThat(json.has("RESIDENT_AUTH")).isTrue();
-        assertThat(json.has("RESIDENT_ENROLLMENT")).isTrue();
-        assertThat(json.has("OPERATOR_AUTH")).isTrue();
-        assertThat(json.has("SUPERVISOR_AUTH")).isTrue();
-    }
-
-    @Test
-    @DisplayName("GET /api/audit/verify validates system in-memory audit log")
-    void getAuditVerifyEndpoint() throws Exception {
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create("http://localhost:" + port + "/api/audit/verify"))
-                .GET()
+        // 3. Supervisor session has no prior ACCEPTED SUPERVISOR_AUTH -> 403
+        String missingSupPayload = mapper.writeValueAsString(Map.of(
+                "targetSessionId", "locked-session-100",
+                "supervisorSessionId", "sup-unauthorized"
+        ));
+        HttpRequest missingSupReq = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/supervisor/override"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + ADMIN_TOKEN)
+                .POST(HttpRequest.BodyPublishers.ofString(missingSupPayload))
                 .build();
+        assertThat(client.send(missingSupReq, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
 
-        HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-        assertThat(resp.statusCode()).isEqualTo(200);
+        // 4. Supervisor session expired (> 5 minutes ago) -> 403
+        String expiredSupId = "sup-expired";
+        LivenessAuditEvent expiredEvent = LivenessAuditEvent.builder()
+                .sessionId(expiredSupId)
+                .workflow(WorkflowType.SUPERVISOR_AUTH)
+                .eventType(AuditEventType.FINAL_DECISION)
+                .decision(DecisionType.ACCEPTED)
+                .timestampMillis(System.currentTimeMillis() - 400_000L) // 6.6 min ago
+                .previousHash("0000000000000000000000000000000000000000000000000000000000000000")
+                .build();
+        serverApp.getMemoryAuditSink().append(expiredEvent);
 
-        JsonNode json = mapper.readTree(resp.body());
-        assertThat(json.path("valid").asBoolean()).isTrue();
-        assertThat(json.path("tamperFree").asBoolean()).isTrue();
+        String expiredPayload = mapper.writeValueAsString(Map.of(
+                "targetSessionId", "locked-session-101",
+                "supervisorSessionId", expiredSupId
+        ));
+        HttpRequest expiredReq = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/supervisor/override"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + ADMIN_TOKEN)
+                .POST(HttpRequest.BodyPublishers.ofString(expiredPayload))
+                .build();
+        assertThat(client.send(expiredReq, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
+
+        // 5. Valid recent supervisor session -> 200 OK
+        String validSupId = "sup-valid-999";
+        LivenessAuditEvent validSupEvent = LivenessAuditEvent.builder()
+                .sessionId(validSupId)
+                .workflow(WorkflowType.SUPERVISOR_AUTH)
+                .eventType(AuditEventType.FINAL_DECISION)
+                .decision(DecisionType.ACCEPTED)
+                .timestampMillis(System.currentTimeMillis() - 30_000L) // 30s ago
+                .previousHash("0000000000000000000000000000000000000000000000000000000000000000")
+                .build();
+        serverApp.getMemoryAuditSink().append(validSupEvent);
+
+        String validPayload = mapper.writeValueAsString(Map.of(
+                "targetSessionId", "locked-session-102",
+                "supervisorSessionId", validSupId
+        ));
+        HttpRequest validReq = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:" + port + "/api/supervisor/override"))
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + ADMIN_TOKEN)
+                .POST(HttpRequest.BodyPublishers.ofString(validPayload))
+                .build();
+        HttpResponse<String> validResp = client.send(validReq, HttpResponse.BodyHandlers.ofString());
+        assertThat(validResp.statusCode()).isEqualTo(200);
+
+        // 6. Reuse / Replay of the same supervisor session -> 403 (single-use enforced!)
+        HttpResponse<String> replayResp = client.send(validReq, HttpResponse.BodyHandlers.ofString());
+        assertThat(replayResp.statusCode()).isEqualTo(403);
     }
 }

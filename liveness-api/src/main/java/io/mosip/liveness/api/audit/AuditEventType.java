@@ -29,5 +29,8 @@ public enum AuditEventType {
     ERROR_OCCURRED,
 
     /** Supervisor authorized override after max retries or exception. */
-    SUPERVISOR_OVERRIDE
+    SUPERVISOR_OVERRIDE,
+
+    /** Client landmarks mismatched server-side face detection or pixel observations. */
+    LANDMARK_MISMATCH
 }

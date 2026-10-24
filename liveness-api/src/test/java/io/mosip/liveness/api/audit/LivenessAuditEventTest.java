@@ -79,4 +79,61 @@ class LivenessAuditEventTest {
         assertThat(tamperedEvent2Hash).isNotEqualTo(event2.currentHash());
         assertThat(event3.previousHash()).isNotEqualTo(tamperedEvent2Hash);
     }
+
+    @Test
+    @DisplayName("Details map is included in hash and tampering with details changes hash")
+    void testDetailsTamperingDetected() {
+        String genesisHash = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        LivenessAuditEvent event = LivenessAuditEvent.builder()
+                .eventId("EVT_100")
+                .sessionId("SESS_100")
+                .eventType(AuditEventType.CHALLENGE_ISSUED)
+                .details(java.util.Map.of("challengeId", "CHG_123", "type", "BLINK"))
+                .previousHash(genesisHash)
+                .build();
+
+        String tamperedHash = LivenessAuditEvent.computeHash(
+                genesisHash,
+                "EVT_100",
+                "SESS_100",
+                event.timestampMillis(),
+                event.workflow(),
+                AuditEventType.CHALLENGE_ISSUED,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                event.modelVersion(),
+                event.deviceId(),
+                java.util.Map.of("challengeId", "CHG_999", "type", "BLINK") // TAMPERED DETAIL
+        );
+
+        assertThat(event.currentHash()).isNotEqualTo(tamperedHash);
+    }
+
+    @Test
+    @DisplayName("HMAC-SHA256 signature computation and validation")
+    void testHmacSignature() {
+        String secretKey = "super-secret-audit-key-123456";
+        String hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        String sig = LivenessAuditEvent.computeHmacSignature(secretKey, hash);
+        assertThat(sig).isNotBlank().hasSize(64);
+
+        // Same inputs produce identical signature
+        String sig2 = LivenessAuditEvent.computeHmacSignature(secretKey, hash);
+        assertThat(sig2).isEqualTo(sig);
+
+        // Different hash produces different signature
+        String sigOtherHash = LivenessAuditEvent.computeHmacSignature(secretKey, "1111111111111111111111111111111111111111111111111111111111111111");
+        assertThat(sigOtherHash).isNotEqualTo(sig);
+
+        // Wrong secret key produces different signature
+        String sigWrongKey = LivenessAuditEvent.computeHmacSignature("wrong-key", hash);
+        assertThat(sigWrongKey).isNotEqualTo(sig);
+    }
 }
+

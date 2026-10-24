@@ -25,12 +25,30 @@ public class FileAuditSink implements AuditSink {
 
     private static final Logger log = LoggerFactory.getLogger(FileAuditSink.class);
 
+    private static final long DEFAULT_MAX_FILE_SIZE = 10L * 1024L * 1024L; // 10 MB
+    private static final int MAX_CACHE_SESSIONS = 1000;
+
     private final File auditFile;
-    private final BufferedWriter writer;
-    private final Map<String, List<LivenessAuditEvent>> sessionCache = new ConcurrentHashMap<>();
+    private final long maxFileSizeBytes;
+    private BufferedWriter writer;
+    private final Map<String, List<LivenessAuditEvent>> sessionCache;
 
     public FileAuditSink(File auditFile) throws IOException {
+        this(auditFile, DEFAULT_MAX_FILE_SIZE);
+    }
+
+    public FileAuditSink(File auditFile, long maxFileSizeBytes) throws IOException {
         this.auditFile = Objects.requireNonNull(auditFile, "Audit file cannot be null");
+        this.maxFileSizeBytes = Math.max(1024L * 1024L, maxFileSizeBytes);
+        this.sessionCache = Collections.synchronizedMap(
+                new java.util.LinkedHashMap<>(128, 0.75f, true) {
+                    @Override
+                    protected boolean removeEldestEntry(Map.Entry<String, List<LivenessAuditEvent>> eldest) {
+                        return size() > MAX_CACHE_SESSIONS;
+                    }
+                }
+        );
+
         File parent = auditFile.getParentFile();
         if (parent != null && !parent.exists()) {
             parent.mkdirs();
@@ -44,12 +62,27 @@ public class FileAuditSink implements AuditSink {
         sessionCache.computeIfAbsent(event.sessionId(), k -> new CopyOnWriteArrayList<>()).add(event);
 
         try {
+            rotateIfExceeded();
             String jsonLine = toJsonLine(event);
             writer.write(jsonLine);
             writer.newLine();
             writer.flush();
         } catch (IOException e) {
             log.error("Failed to append audit record to file: {}", auditFile.getAbsolutePath(), e);
+        }
+    }
+
+    private void rotateIfExceeded() throws IOException {
+        if (auditFile.exists() && auditFile.length() >= maxFileSizeBytes) {
+            writer.flush();
+            writer.close();
+            File rotated = new File(auditFile.getAbsolutePath() + ".1");
+            if (rotated.exists()) {
+                rotated.delete();
+            }
+            auditFile.renameTo(rotated);
+            this.writer = new BufferedWriter(new FileWriter(auditFile, StandardCharsets.UTF_8, true));
+            log.info("Rotated audit log file {} -> {}", auditFile.getName(), rotated.getName());
         }
     }
 
@@ -63,8 +96,10 @@ public class FileAuditSink implements AuditSink {
     @Override
     public synchronized void close() {
         try {
-            writer.flush();
-            writer.close();
+            if (writer != null) {
+                writer.flush();
+                writer.close();
+            }
         } catch (IOException e) {
             log.warn("Error closing audit log writer", e);
         }
@@ -86,15 +121,17 @@ public class FileAuditSink implements AuditSink {
         appendKv(sb, "workflow", event.workflow() != null ? event.workflow().name() : null, true);
         appendKv(sb, "eventType", event.eventType() != null ? event.eventType().name() : null, true);
         appendKv(sb, "decision", event.decision() != null ? event.decision().name() : null, true);
-        sb.append("\"passiveScore\":").append(event.passiveScore() != null ? String.format("%.4f", event.passiveScore()) : "null").append(",");
+        sb.append("\"passiveScore\":").append(event.passiveScore() != null ? String.format(java.util.Locale.ROOT, "%.4f", event.passiveScore()) : "null").append(",");
         appendKv(sb, "padClassification", event.padClassification() != null ? event.padClassification().name() : null, true);
-        sb.append("\"padScore\":").append(event.padScore() != null ? String.format("%.4f", event.padScore()) : "null").append(",");
+        sb.append("\"padScore\":").append(event.padScore() != null ? String.format(java.util.Locale.ROOT, "%.4f", event.padScore()) : "null").append(",");
         appendKv(sb, "challengeType", event.challengeType() != null ? event.challengeType().name() : null, true);
         appendKv(sb, "errorCode", event.errorCode(), true);
         appendKv(sb, "modelVersion", event.modelVersion(), true);
         appendKv(sb, "deviceId", event.deviceId(), true);
+        sb.append("\"details\":").append(LivenessAuditEvent.canonicalJsonDetails(event.details())).append(",");
         appendKv(sb, "previousHash", event.previousHash(), true);
-        appendKv(sb, "currentHash", event.currentHash(), false);
+        appendKv(sb, "currentHash", event.currentHash(), true);
+        appendKv(sb, "signature", event.signature(), false);
         sb.append("}");
         return sb.toString();
     }

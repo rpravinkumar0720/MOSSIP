@@ -22,10 +22,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Javalin application configuring REST endpoints, WebSocket streaming,
@@ -40,6 +43,8 @@ public class LivenessServerApp {
     private final DefaultLivenessEngine engine;
     private final InMemoryAuditSink memoryAuditSink;
     private final WebSocketHandler wsHandler;
+    private final SessionTokenService tokenService;
+    private final Set<String> usedSupervisorSessions = ConcurrentHashMap.newKeySet();
     private Javalin app;
 
     public LivenessServerApp(ServerConfig config) {
@@ -65,6 +70,7 @@ public class LivenessServerApp {
         );
         this.engine.setLockoutDurationMillis(config.lockoutSeconds() * 1000L);
         this.wsHandler = new WebSocketHandler(this.engine, config);
+        this.tokenService = new SessionTokenService(config.sessionSecret());
     }
 
     public Javalin createApp() {
@@ -87,6 +93,7 @@ public class LivenessServerApp {
         // REST endpoints
         long serverStartTimeMillis = System.currentTimeMillis();
 
+        // 1. Health endpoint (public)
         app.get("/api/health", ctx -> {
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("status", "UP");
@@ -97,21 +104,66 @@ public class LivenessServerApp {
             resp.put("lockoutSeconds", config.lockoutSeconds());
             resp.put("uptimeSeconds", (System.currentTimeMillis() - serverStartTimeMillis) / 1000);
             resp.put("totalAuditEvents", memoryAuditSink.getAllEvents().size());
-            resp.put("auditChainIntegrity", AuditChainVerifier.verify(memoryAuditSink.getAllEvents()).valid());
+            resp.put("auditChainIntegrity", AuditChainVerifier.verifySessions(memoryAuditSink.getAllEvents()).valid());
             resp.put("activeWebSocketSessions", wsHandler.getActiveSessionCount());
             resp.put("timestamp", java.time.Instant.now().toString());
             ctx.json(resp);
         });
 
-        // Audit endpoints
+        // 2. Authenticated Session Creation endpoint
+        app.post("/api/v1/sessions", ctx -> {
+            if (!isOriginAllowed(ctx.header("Origin"))) {
+                ctx.status(HttpStatus.FORBIDDEN).json(Map.of("error", "Forbidden origin"));
+                return;
+            }
+
+            try {
+                JsonNode body = ctx.body().isBlank() ? null : mapper.readTree(ctx.body());
+                String wfStr = body != null ? body.path("workflow").asText("RESIDENT_AUTH") : "RESIDENT_AUTH";
+                WorkflowType workflow = WorkflowType.RESIDENT_AUTH;
+                try {
+                    workflow = WorkflowType.valueOf(wfStr.trim().toUpperCase());
+                } catch (IllegalArgumentException ignored) {}
+
+                String clientIdentity = body != null ? body.path("clientIdentity").asText("") : "";
+                if (clientIdentity.isBlank()) {
+                    clientIdentity = ctx.ip();
+                }
+
+                String sessionId = java.util.UUID.randomUUID().toString();
+                long validityMs = 600_000L; // 10 minutes
+                String token = tokenService.issueToken(sessionId, workflow, clientIdentity, validityMs);
+
+                LivenessPolicy policy = resolveWorkflowPolicy(workflow);
+                Map<String, Object> resp = new LinkedHashMap<>();
+                resp.put("sessionId", sessionId);
+                resp.put("token", token);
+                resp.put("workflow", workflow.name());
+                resp.put("expiresInSeconds", validityMs / 1000);
+                resp.put("policy", serializePolicy(workflow, policy));
+                ctx.json(resp);
+            } catch (Exception e) {
+                ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "Invalid request: " + e.getMessage()));
+            }
+        });
+
+        // 3. Admin-Gated Audit endpoints
         app.get("/api/audit", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
             List<LivenessAuditEvent> allEvents = memoryAuditSink.getAllEvents();
             ctx.json(allEvents);
         });
 
         app.get("/api/audit/verify", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
             List<LivenessAuditEvent> allEvents = memoryAuditSink.getAllEvents();
-            AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verify(allEvents);
+            AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verifySessions(allEvents);
             Map<String, Object> resp = new LinkedHashMap<>();
             resp.put("valid", result.valid());
             resp.put("count", allEvents.size());
@@ -122,12 +174,20 @@ public class LivenessServerApp {
         });
 
         app.get("/api/audit/{sessionId}", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
             String sessionId = ctx.pathParam("sessionId");
             List<LivenessAuditEvent> events = memoryAuditSink.getEventsForSession(sessionId);
             ctx.json(events);
         });
 
         app.get("/api/audit/{sessionId}/verify", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
             String sessionId = ctx.pathParam("sessionId");
             List<LivenessAuditEvent> events = memoryAuditSink.getEventsForSession(sessionId);
             AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verify(events);
@@ -142,12 +202,16 @@ public class LivenessServerApp {
         });
 
         app.post("/api/audit/verify", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
             try {
                 List<LivenessAuditEvent> events = mapper.readValue(
                         ctx.body(),
                         new TypeReference<List<LivenessAuditEvent>>() {}
                 );
-                AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verify(events);
+                AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verifySessions(events);
                 Map<String, Object> resp = new LinkedHashMap<>();
                 resp.put("valid", result.valid());
                 resp.put("count", events != null ? events.size() : 0);
@@ -164,8 +228,12 @@ public class LivenessServerApp {
             }
         });
 
-        // Policy endpoints
+        // 4. Admin-Gated Policy endpoints
         app.get("/api/policy", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
             Map<String, Object> allPolicies = new LinkedHashMap<>();
             for (WorkflowType wf : WorkflowType.values()) {
                 LivenessPolicy p = resolveWorkflowPolicy(wf);
@@ -175,6 +243,10 @@ public class LivenessServerApp {
         });
 
         app.get("/api/policy/{workflow}", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
             String wfParam = ctx.pathParam("workflow").trim().toUpperCase().replace("-", "_");
             WorkflowType wf;
             try {
@@ -191,40 +263,65 @@ public class LivenessServerApp {
             ctx.json(serializePolicy(wf, policy));
         });
 
+        // 5. Admin-Gated Supervisor Override endpoint
         app.post("/api/supervisor/override", ctx -> {
+            if (!isAuthorizedAdmin(ctx)) {
+                ctx.status(HttpStatus.UNAUTHORIZED).json(Map.of("error", "Unauthorized: Admin Bearer token required"));
+                return;
+            }
+
             try {
                 JsonNode body = mapper.readTree(ctx.body());
-                String targetSessionId = body.path("targetSessionId").asText("");
-                String supervisorSessionId = body.path("supervisorSessionId").asText("");
+                String targetSessionId = body.path("targetSessionId").asText("").trim();
+                String supervisorSessionId = body.path("supervisorSessionId").asText("").trim();
 
                 if (targetSessionId.isBlank()) {
                     ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "targetSessionId is required"));
                     return;
                 }
 
-                // Verify supervisor session if in strict mode, or check that it was accepted
-                boolean authorized = false;
                 if (supervisorSessionId.isBlank()) {
-                    if (config.demoMode()) {
-                        // Demo shortcut allows supervisor override with placeholder supervisor id
-                        supervisorSessionId = "demo-supervisor";
-                        authorized = true;
-                    }
-                } else {
-                    List<LivenessAuditEvent> supervisorEvents = memoryAuditSink.getEventsForSession(supervisorSessionId);
-                    boolean hasAccepted = supervisorEvents.stream()
-                            .anyMatch(ev -> ev.decision() == DecisionType.ACCEPTED && ev.workflow() == WorkflowType.SUPERVISOR_AUTH);
-                    authorized = hasAccepted || config.demoMode();
+                    ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "supervisorSessionId is required"));
+                    return;
                 }
 
-                if (!authorized) {
+                if (targetSessionId.equals(supervisorSessionId)) {
+                    ctx.status(HttpStatus.BAD_REQUEST).json(Map.of("error", "targetSessionId and supervisorSessionId must be distinct"));
+                    return;
+                }
+
+                if (usedSupervisorSessions.contains(supervisorSessionId)) {
+                    ctx.status(HttpStatus.FORBIDDEN).json(Map.of("error", "Supervisor session already used (single-use policy)"));
+                    return;
+                }
+
+                List<LivenessAuditEvent> supervisorEvents = memoryAuditSink.getEventsForSession(supervisorSessionId);
+                LivenessAuditEvent acceptedEvent = supervisorEvents.stream()
+                        .filter(ev -> ev.decision() == DecisionType.ACCEPTED && ev.workflow() == WorkflowType.SUPERVISOR_AUTH)
+                        .findFirst()
+                        .orElse(null);
+
+                if (acceptedEvent == null) {
                     ctx.status(HttpStatus.FORBIDDEN).json(Map.of(
                             "error", "Supervisor override requires a valid prior ACCEPTED SUPERVISOR_AUTH session."
                     ));
                     return;
                 }
 
+                // Check recency: must be within last 5 minutes (300,000 ms)
+                long now = System.currentTimeMillis();
+                if (now - acceptedEvent.timestampMillis() > 300_000L) {
+                    ctx.status(HttpStatus.FORBIDDEN).json(Map.of(
+                            "error", "Supervisor session expired (> 5 minutes old)."
+                    ));
+                    return;
+                }
+
+                // Enforce single-use
+                usedSupervisorSessions.add(supervisorSessionId);
                 engine.recordSupervisorOverride(targetSessionId, supervisorSessionId);
+                log.info("Supervisor override authorized: supervisor={}, target={}", supervisorSessionId, targetSessionId);
+
                 ctx.json(Map.of(
                         "success", true,
                         "targetSessionId", targetSessionId,
@@ -237,6 +334,32 @@ public class LivenessServerApp {
         });
 
         return app;
+    }
+
+    private boolean isAuthorizedAdmin(io.javalin.http.Context ctx) {
+        String authHeader = ctx.header("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            return false;
+        }
+        String token = authHeader.substring(7).trim();
+        String expected = config.adminToken();
+        if (expected == null || expected.isBlank()) {
+            return false;
+        }
+        return MessageDigest.isEqual(
+                token.getBytes(StandardCharsets.UTF_8),
+                expected.getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
+    private boolean isOriginAllowed(String origin) {
+        if (origin == null || origin.isBlank()) return true;
+        List<String> allowed = config.allowedOrigins();
+        if (allowed == null || allowed.isEmpty() || allowed.contains("*")) return true;
+        for (String a : allowed) {
+            if (origin.equalsIgnoreCase(a) || a.equals("*")) return true;
+        }
+        return false;
     }
 
     private static LivenessPolicy resolveWorkflowPolicy(WorkflowType wf) {
@@ -291,6 +414,10 @@ public class LivenessServerApp {
 
     public InMemoryAuditSink getMemoryAuditSink() {
         return memoryAuditSink;
+    }
+
+    public SessionTokenService getTokenService() {
+        return tokenService;
     }
 
     private static class CompositeAuditSink implements AuditSink {

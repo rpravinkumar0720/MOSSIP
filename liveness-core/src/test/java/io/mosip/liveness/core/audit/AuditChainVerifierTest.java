@@ -122,4 +122,106 @@ class AuditChainVerifierTest {
             }
         }
     }
+
+    @Test
+    @DisplayName("Front truncation (dropping first event) is detected")
+    void testFrontTruncationDetected() {
+        List<LivenessAuditEvent> chain = createValidSessionChain("sess-005", 4);
+
+        // Drop the first event (so new first event has non-genesis previousHash)
+        List<LivenessAuditEvent> truncated = new ArrayList<>(chain.subList(1, chain.size()));
+
+        AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verify(truncated);
+        assertThat(result.valid()).isFalse();
+        assertThat(result.firstBrokenIndex()).isEqualTo(0);
+        assertThat(result.message()).contains("Front-truncation detected");
+    }
+
+    @Test
+    @DisplayName("Tampering with details map breaks hash verification")
+    void testDetailsTamperDetected() {
+        List<LivenessAuditEvent> chain = createValidSessionChain("sess-006", 3);
+
+        LivenessAuditEvent original = chain.get(1);
+        LivenessAuditEvent tampered = new LivenessAuditEvent(
+                original.eventId(),
+                original.sessionId(),
+                original.timestampMillis(),
+                original.workflow(),
+                original.eventType(),
+                original.decision(),
+                original.passiveScore(),
+                original.padClassification(),
+                original.padScore(),
+                original.challengeType(),
+                original.errorCode(),
+                original.modelVersion(),
+                original.deviceId(),
+                Map.of("frameIndex", "9999"), // Tampered details!
+                original.previousHash(),
+                original.currentHash()
+        );
+        chain.set(1, tampered);
+
+        AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verify(chain);
+        assertThat(result.valid()).isFalse();
+        assertThat(result.firstBrokenIndex()).isEqualTo(1);
+        assertThat(result.message()).contains("Payload tamper detected");
+    }
+
+    @Test
+    @DisplayName("Sequential sessions starting at GENESIS all verify as valid")
+    void testSequentialSessionsVerify() {
+        List<LivenessAuditEvent> s1 = createValidSessionChain("sess-A", 3);
+        List<LivenessAuditEvent> s2 = createValidSessionChain("sess-B", 3);
+
+        List<LivenessAuditEvent> combined = new ArrayList<>();
+        combined.addAll(s1);
+        combined.addAll(s2);
+
+        AuditChainVerifier.AuditVerificationResult result = AuditChainVerifier.verify(combined);
+        assertThat(result.valid()).isTrue();
+        assertThat(result.message()).contains("verified (6 events)");
+    }
+
+    @Test
+    @DisplayName("HMAC signature on final event verifies and detects unkeyed recomputation")
+    void testHmacSignatureVerification() {
+        String hmacKey = "test-audit-secret-key-xyz";
+        List<LivenessAuditEvent> chain = createValidSessionChain("sess-signed", 3);
+
+        // Sign final event
+        int lastIdx = chain.size() - 1;
+        LivenessAuditEvent last = chain.get(lastIdx);
+        String sig = LivenessAuditEvent.computeHmacSignature(hmacKey, last.currentHash());
+        LivenessAuditEvent signedLast = new LivenessAuditEvent(
+                last.eventId(), last.sessionId(), last.timestampMillis(), last.workflow(),
+                last.eventType(), last.decision(), last.passiveScore(), last.padClassification(),
+                last.padScore(), last.challengeType(), last.errorCode(), last.modelVersion(),
+                last.deviceId(), last.details(), last.previousHash(), last.currentHash(), sig
+        );
+        chain.set(lastIdx, signedLast);
+
+        // Valid signature verifies
+        AuditChainVerifier.AuditVerificationResult resValid = AuditChainVerifier.verify(chain, hmacKey);
+        assertThat(resValid.valid()).isTrue();
+
+        // Verification with wrong key fails
+        AuditChainVerifier.AuditVerificationResult resWrongKey = AuditChainVerifier.verify(chain, "wrong-key");
+        assertThat(resWrongKey.valid()).isFalse();
+        assertThat(resWrongKey.message()).contains("Final event signature invalid");
+
+        // Recomputed chain without key (missing signature) fails
+        LivenessAuditEvent unsignedLast = new LivenessAuditEvent(
+                last.eventId(), last.sessionId(), last.timestampMillis(), last.workflow(),
+                last.eventType(), last.decision(), last.passiveScore(), last.padClassification(),
+                last.padScore(), last.challengeType(), last.errorCode(), last.modelVersion(),
+                last.deviceId(), last.details(), last.previousHash(), last.currentHash(), null
+        );
+        chain.set(lastIdx, unsignedLast);
+        AuditChainVerifier.AuditVerificationResult resNoSig = AuditChainVerifier.verify(chain, hmacKey);
+        assertThat(resNoSig.valid()).isFalse();
+        assertThat(resNoSig.message()).contains("signature missing");
+    }
 }
+
